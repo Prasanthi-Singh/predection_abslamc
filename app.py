@@ -1,1489 +1,4475 @@
+"""
+=============================================================================
+ SALES PERFORMANCE, SCENARIO PLANNING & REVENUE IMPACT DASHBOARD
+=============================================================================
+ Senior-management decision-support application for asset-management sales.
+
+ Run with:
+     streamlit run app.py
+
+ Stack: Python | Streamlit | Pandas | NumPy | OpenPyXL
+=============================================================================
+"""
+
+from __future__ import annotations
+
+import inspect
 import io
-import re
-from typing import Dict, Tuple
+from html import escape
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+from openpyxl import load_workbook as openpyxl_load_workbook
 
+# =============================================================================
+# 1. APPLICATION CONFIGURATION  (management assumptions only - no business data)
+# =============================================================================
 
-st.set_page_config(
-    page_title="Employee Performance Forecast & Scenario Planner",
-    page_icon="📊",
-    layout="wide",
+APP_TITLE = "Sales Performance Scenario Planner"
+APP_SUBTITLE = (
+    "Current state → selected management scenario → required future state → revenue impact"
 )
 
-st.markdown(
-    """
-    <style>
-    .block-container {padding-top: 1.4rem; padding-bottom: 2rem;}
-    div[data-testid="stMetric"] {
-        border: 1px solid rgba(128,128,128,.25);
-        border-radius: 12px;
-        padding: 14px;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+# --- Financial-year timeline -------------------------------------------------
+MONTHS_COMPLETED = 3        # April, May, June are complete
+MONTHS_REMAINING = 9        # July .. March
+MONTHS_JUL_JAN = 7          # July .. January
+MONTHS_FEB_MAR = 2          # February, March
 
-# -------------------------------------------------------------------
-# Expected input columns
-# -------------------------------------------------------------------
-# Full structure expected from the employee performance Excel.
-# Extra columns are still allowed.
-EXPECTED_INPUT_COLUMNS = [
-    "Emp Code",
-    "ADID",
-    "Status",
-    "Type",
-    "Employee Name",
-    "DOJ",
-    "ZONE",
-    "REGION",
-    "EM City",
-    "MKT TYPE",
-    "FY 26 TGT EQ",
-    "YTD June EQ TGT",
-    "Equity GS Ach YTD June",
-    "Equity GS % Ach YTD June",
-    "Quarterly Gap",
-    "Scenario 1",
-    "Scenario 2",
-    "120% Target",
-    "Scenario 3",
-    "FY 26 TGT DT",
-    "YTD June DT TGT",
-    "Debt GS Ach",
-    "Debt GS Ach%",
-    "Quarterly Gap",
-    "Scenario 1",
-    "Scenario 2",
-    "120% Target",
-    "Scenario 3",
-    "FY 26 TGT LIQ",
-    "YTD June LIQ TGT",
-    "Liquid GS Ach",
-    "Liquid GS Ach %",
-    "Quarterly Gap",
-    "Scenario 1",
-    "Scenario 2",
-    "120% Target",
-    "Scenario 3",
-    "WGS % AchYTD June",
-    "WGS Weightage",
-    "WGS Score",
-    "X",
-    "FY 26 TGT EQ NS",
-    "YTD June EQ NS TGT",
-    "Equity NS Ach YTD June",
-    "Equity NS Ach",
-    "Quarterly Gap",
-    "Scenario 1",
-    "Scenario 2",
-    "120% Target",
-    "Scenario 3",
-    "FY 26 TGT DT NS",
-    "YTD June DT NS TGT",
-    "Debt NS Ach",
-    "Debt NS Ach",
-    "Quarterly Gap",
-    "Scenario 1",
-    "Scenario 2",
-    "120% Target",
-    "Scenario 3",
-    "FY 26 TGT LIQ NS",
-    "YTD June LIQ NS TGT",
-    "Liquid NS Ach",
-    "Liquid NS Ach",
+FUTURE_MONTHS: List[str] = [
+    "July", "August", "September", "October",
+    "November", "December", "January", "February", "March",
 ]
+MOMENTUM_MONTHS = FUTURE_MONTHS[:MONTHS_JUL_JAN]      # July .. January
+LEAKAGE_MONTHS = FUTURE_MONTHS[MONTHS_JUL_JAN:]       # February, March
+MONTH_DATES = pd.date_range("2026-07-01", periods=len(FUTURE_MONTHS), freq="MS")
 
-# Only these columns are mandatory for the scenario calculations.
-REQUIRED_COLUMNS = [
-    "Employee Name",
-    "FY 26 TGT EQ",
-    "Equity GS Ach YTD June",
-    "FY 26 TGT DT",
-    "Debt GS Ach",
-    "FY 26 TGT LIQ",
-    "Liquid GS Ach",
-    "FY 26 TGT EQ NS",
-    "Equity NS Ach YTD June",
-    "FY 26 TGT DT NS",
-    "Debt NS Ach",
-    "FY 26 TGT LIQ NS",
-    "Liquid NS Ach",
-]
+# --- Revenue assumptions (basis points) --------------------------------------
+REVENUE_BPS: Dict[str, float] = {"Equity": 60.0, "Debt": 20.0, "Liquid": 10.0}
+REVENUE_RATE: Dict[str, float] = {k: v / 10000.0 for k, v in REVENUE_BPS.items()}
 
-# Identification / organisation fields carried into result tables.
-METADATA_COLUMNS = [
-    "Emp Code",
-    "ADID",
-    "Status",
-    "Type",
-    "Employee Name",
-    "DOJ",
-    "ZONE",
-    "REGION",
-    "EM City",
-    "MKT TYPE",
-]
+ASSETS: List[str] = ["Equity", "Debt", "Liquid"]
+SALES_TYPES: List[str] = ["GS", "NS"]
+SALES_LABEL: Dict[str, str] = {"GS": "Gross Sales", "NS": "Net Sales"}
+VERTICALS: List[str] = ["Retail", "DHNI", "VRM"]
 
-FORECAST_NAME = "Current Run Rate Forecast"
+# --- Scenario assumptions -----------------------------------------------------
+S1_RUNRATE_UPLIFT = 0.20            # +20% on current run rate
+S2_EQUITY_TARGET = 1.00             # 100% of Equity FY target by January
+S2_OVERALL_TARGET = 0.75            # 75% of overall FY target by January
+S3_TARGET = 1.00                    # 100% of FY target by January
+S3_DEFAULT_DIP = 0.20               # default Feb-Mar run-rate dip
+S4_TARGET = 1.20                    # 120% of FY target by March
+S5_EQUITY_TARGET = 1.20             # 120% Equity by March
+S5_OVERALL_TARGET = 1.00            # 100% overall by March
+S6_SEGMENT_TARGETS: Dict[str, float] = {
+    "Digital": 1.40,
+    "Retail B30": 1.25,
+    "Others": 1.15,
+}
+S7_DEFAULT_JAN_TARGET = 1.00        # January milestone = 100% of FY target
+S7_DEFAULT_MAR_TARGET = 1.00        # March outcome = 100% of FY target
+S7_DEFAULT_LEAKAGE = 0.20           # Feb-Mar AUM leakage / run-rate pressure
 
-SCENARIO_NAMES = [
-    FORECAST_NAME,
-    "Scenario 1",
-    "Scenario 2",
-    "Scenario 3",
-    "Scenario 4",
-]
+SEGMENT_ORDER: List[str] = ["Digital", "Retail B30", "Others"]
+
+# --- Scenario navigator definitions -------------------------------------------
+SCENARIOS: Dict[int, Dict[str, str]] = {
+    1: {
+        "label": "Scenario 1 · +20% Run-Rate Push",
+        "name": "+20% Run-Rate Push",
+        "kind": "runrate",
+        "explanation": (
+            "Increase the current Apr-Jun monthly run rate by 20% from July onward "
+            "and measure the resulting March achievement."
+        ),
+        "milestone": "March 2027 · run rate lifted 20% for the remaining 9 months",
+    },
+    2: {
+        "label": "Scenario 2 · 75% Overall by Jan + 100% Equity",
+        "name": "75% Overall by January + 100% Equity",
+        "kind": "jan_target",
+        "explanation": (
+            "Reach 100% of the Equity FY target and 75% of the overall FY target by January. "
+            "The residual requirement is allocated to Debt and Liquid in FY-target proportion."
+        ),
+        "milestone": "January 2027 · Equity 100% of FY target, portfolio 75% of FY target",
+    },
+    3: {
+        "label": "Scenario 3 · 100% by Jan, Then Feb-Mar Dip",
+        "name": "100% by January, then Feb-Mar dip",
+        "kind": "jan_target",
+        "explanation": (
+            "Reach 100% of the FY target by January, followed by a configurable "
+            "February-March run-rate decline."
+        ),
+        "milestone": "January 2027 · 100% of FY target, then a reduced Feb-Mar run rate",
+    },
+    4: {
+        "label": "Scenario 4 · 120% by March",
+        "name": "120% by March",
+        "kind": "march_target",
+        "explanation": (
+            "Determine the monthly run rate required to finish March at 120% of the FY target."
+        ),
+        "milestone": "March 2027 · 120% of FY target",
+    },
+    5: {
+        "label": "Scenario 5 · 120% Equity + 100% Overall",
+        "name": "120% Equity + 100% Overall by March",
+        "kind": "march_target",
+        "explanation": (
+            "Reach 120% of the Equity FY target and 100% of the overall FY target by March, "
+            "with Debt and Liquid balancing the remaining requirement."
+        ),
+        "milestone": "March 2027 · Equity 120% of FY target, portfolio 100% of FY target",
+    },
+    6: {
+        "label": "Scenario 6 · Digital 140% + B30 125% + Others 115%",
+        "name": "Digital 140% + Retail B30 125% + Others 115%",
+        "kind": "march_target",
+        "explanation": (
+            "Model differentiated performance where Digital achieves 140%, Retail B30 achieves "
+            "125% and Others achieve 115% of their respective FY targets."
+        ),
+        "milestone": "March 2027 · differentiated achievement by business segment",
+    },
+    7: {
+        "label": "Scenario 7 · Momentum Build-Up to March 2027",
+        "name": "Momentum Build-Up to March 2027",
+        "kind": "momentum",
+        "explanation": (
+            "Build progressive month-on-month momentum from July 2026 to reach the January 2027 "
+            "milestone, create sufficient buffer to absorb Feb-Mar AUM leakage, and protect the "
+            "March 2027 target."
+        ),
+        "milestone": "January 2027 milestone → Feb-Mar leakage absorbed → March 2027 target held",
+    },
+}
+SCENARIO_ORDER: List[int] = [1, 2, 3, 4, 5, 6, 7]
+
+# --- Workbook contract --------------------------------------------------------
+SHEET_ALIASES: Dict[str, List[str]] = {
+    "Retail": ["RM Retail Sales", "RM Retail", "Retail Sales"],
+    "DHNI": ["RM DHNI", "DHNI", "RM D-HNI"],
+    "VRM": ["VRM", "RM VRM", "VRM Sales"],
+}
+
+# Presentation/dashboard sheet. It is deliberately NOT included in
+# SHEET_ALIASES because it is not an employee-level calculation sheet.
+FINAL_SHEET_ALIASES: List[str] = ["FINAL", "Final", "Final Dashboard"]
+
+COLUMN_SPEC: Dict[Tuple[str, str], Dict[str, List[str]]] = {
+    ("GS", "Equity"): {
+        "fy": ["FY 26 TGT EQ"],
+        "ytd_tgt": ["YTD June EQ TGT"],
+        "ach": ["Equity GS Ach YTD June"],
+    },
+    ("GS", "Debt"): {
+        "fy": ["FY 26 TGT DT"],
+        "ytd_tgt": ["YTD June DT TGT"],
+        "ach": ["Debt GS Ach"],
+    },
+    ("GS", "Liquid"): {
+        "fy": ["FY 26 TGT LIQ"],
+        "ytd_tgt": ["YTD June LIQ TGT"],
+        "ach": ["Liquid GS Ach"],
+    },
+    ("NS", "Equity"): {
+        "fy": ["FY 26 TGT EQ NS"],
+        "ytd_tgt": ["YTD June EQ NS TGT"],
+        "ach": ["Equity NS Ach YTD June"],
+    },
+    ("NS", "Debt"): {
+        "fy": ["FY 26 TGT DT NS"],
+        "ytd_tgt": ["YTD June DT NS TGT"],
+        "ach": ["Debt NS Ach"],
+    },
+    ("NS", "Liquid"): {
+        "fy": ["FY 26 TGT LIQ NS"],
+        "ytd_tgt": ["YTD June LIQ NS TGT"],
+        "ach": ["Liquid NS Ach"],
+    },
+}
+
+META_ALIASES: Dict[str, List[str]] = {
+    "Employee Name": ["Employee Name", "Emp Name", "Name"],
+    "Emp Code": ["Emp Code", "Employee Code"],
+    "ADID": ["ADID", "AD ID"],
+    "Status": ["Status", "Employee Status"],
+    "Type": ["Type", "Employment Type", "Functional Designation"],
+    "ZONE": ["ZONE", "Zone"],
+    "REGION": ["REGION", "Region"],
+    "EM City": ["EM City", "City", "Location"],
+    "MKT TYPE": ["MKT TYPE", "Market Type", "Mkt Type"],
+}
+META_FIELDS: List[str] = list(META_ALIASES.keys())
+
+# -----------------------------------------------------------------------------
+# SEGMENT CLASSIFICATION CONFIGURATION (Scenario 6)
+# Edit this block to change how business segments are identified. The scenario
+# calculation engine reads the resulting mapping and never needs to change.
+# -----------------------------------------------------------------------------
+SEGMENT_RULES: Dict[str, Dict[str, Any]] = {
+    "Digital": {
+        "search_columns": ["MKT TYPE", "Type", "REGION", "ZONE", "EM City", "Status"],
+        "keywords": ["digital", "online", "d2c", "e-com", "ecom", "virtual", "vrm",
+                     "inside sales", "web"],
+    },
+    "Retail B30": {
+        "search_columns": ["MKT TYPE", "REGION", "Type"],
+        "keywords": ["b30"],
+    },
+}
+FALLBACK_SEGMENT = "Others"
 
 
-def normalize_column_name(name: object) -> str:
-    """Normalize Excel headers so NBSP / repeated spaces do not break matching."""
-    value = str(name).replace("\u00a0", " ").strip()
-    return " ".join(value.split())
+# =============================================================================
+# 2. GENERIC HELPERS
+# =============================================================================
+
+class WorkbookError(Exception):
+    """Raised when the uploaded workbook does not satisfy the data contract."""
 
 
-def normalize_input_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a copy with cleaned Excel column names."""
-    cleaned = df.copy()
-    cleaned.columns = [normalize_column_name(c) for c in cleaned.columns]
-    return cleaned
+def normalize_column_name(column: Any) -> str:
+    """Collapse non-breaking spaces, repeated spaces and stray padding."""
+    return " ".join(str(column).replace("\u00a0", " ").strip().split())
 
 
-def clean_numeric(series: pd.Series) -> pd.Series:
-    """Convert Excel-style numeric columns safely to float."""
-    return pd.to_numeric(series, errors="coerce").fillna(0.0)
+def _norm_key(column: Any) -> str:
+    return normalize_column_name(column).casefold()
 
 
-def validate_input(df: pd.DataFrame) -> Tuple[bool, list]:
-    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
-    return len(missing) == 0, missing
+def _squash_key(column: Any) -> str:
+    return "".join(ch for ch in _norm_key(column) if ch.isalnum())
 
 
-def proportional_non_equity_targets(
-    eq_target: pd.Series,
-    debt_target: pd.Series,
-    liq_target: pd.Series,
-    equity_multiplier: float,
-    overall_multiplier: float,
-) -> Tuple[pd.Series, pd.Series, pd.Series]:
+def normalize_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of the frame with normalised column labels."""
+    out = frame.copy()
+    out.columns = [normalize_column_name(c) for c in out.columns]
+    return out
+
+
+def clean_numeric(series: Optional[pd.Series]) -> pd.Series:
+    """Coerce a column to numeric, tolerating text-formatted numbers."""
+    if series is None:
+        return pd.Series(dtype="float64")
+    if series.dtype == object:
+        series = (
+            series.astype(str)
+            .str.replace("\u00a0", " ", regex=False)
+            .str.replace(",", "", regex=False)
+            .str.replace("₹", "", regex=False)
+            .str.replace("%", "", regex=False)
+            .str.strip()
+            .replace({"": np.nan, "-": np.nan, "nan": np.nan, "NA": np.nan, "N/A": np.nan})
+        )
+    return pd.to_numeric(series, errors="coerce")
+
+
+def as_text(series: pd.Series) -> pd.Series:
+    """Coerce any column to clean text, mapping every missing marker to ''."""
+    filled = series.where(series.notna(), "")
+    return (
+        filled.astype(str)
+        .str.replace("\u00a0", " ", regex=False)
+        .str.strip()
+        .replace({"nan": "", "NaN": "", "NaT": "", "None": "", "<NA>": ""})
+    )
+
+
+def text_column(frame: pd.DataFrame, column: str) -> pd.Series:
+    """Safe accessor for a metadata column that may be absent."""
+    if column not in frame.columns:
+        return pd.Series([""] * len(frame), index=frame.index, dtype=object)
+    return as_text(frame[column])
+
+
+def safe_div(numerator: Optional[float], denominator: Optional[float]) -> Optional[float]:
+    """Division that never raises and never returns inf/nan."""
+    try:
+        if numerator is None or denominator is None:
+            return None
+        n = float(numerator)
+        d = float(denominator)
+        if not np.isfinite(n) or not np.isfinite(d) or abs(d) < 1e-12:
+            return None
+        result = n / d
+        return result if np.isfinite(result) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _num(value: Any) -> Optional[float]:
+    """Normalise a possibly-missing numeric to float or None."""
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if np.isfinite(f) else None
+
+
+def _z(value: Any) -> float:
+    """Numeric value with missing treated as zero (for summation)."""
+    v = _num(value)
+    return 0.0 if v is None else v
+
+
+def _ssum(series: pd.Series) -> Optional[float]:
+    """Sum that returns None when every entry is missing."""
+    total = series.sum(min_count=1)
+    return _num(total)
+
+
+# --- Display formatting -------------------------------------------------------
+
+NA_TEXT = "0"
+
+
+def fmt_cr(value: Any, decimals: int = 0) -> str:
+    v = _num(value)
+    if v is None:
+        return NA_TEXT
+    return f"₹ {v:,.{decimals}f} Cr"
+
+
+def fmt_cr_signed(value: Any, decimals: int = 0) -> str:
+    v = _num(value)
+    if v is None:
+        return NA_TEXT
+    return f"₹ {v:+,.{decimals}f} Cr"
+
+
+def fmt_pct(value: Any, decimals: int = 1) -> str:
+    v = _num(value)
+    if v is None:
+        return NA_TEXT
+    return f"{v * 100:,.{decimals}f}%"
+
+
+def fmt_pct_signed(value: Any, decimals: int = 1) -> str:
+    v = _num(value)
+    if v is None:
+        return NA_TEXT
+    return f"{v * 100:+,.{decimals}f}%"
+
+
+def fmt_pts(value: Any, decimals: int = 1) -> str:
+    """Percentage-point delta, e.g. +18.4 pts."""
+    v = _num(value)
+    if v is None:
+        return NA_TEXT
+    return f"{v * 100:+,.{decimals}f} pts"
+
+
+def fmt_num(value: Any, decimals: int = 0) -> str:
+    v = _num(value)
+    if v is None:
+        return NA_TEXT
+    return f"{v:,.{decimals}f}"
+
+
+FORMATTERS = {
+    "cr": fmt_cr,
+    "cr1": lambda v: fmt_cr(v, 1),
+    "cr_signed": fmt_cr_signed,
+    "cr1_signed": lambda v: fmt_cr_signed(v, 1),
+    "pct": fmt_pct,
+    "pct_signed": fmt_pct_signed,
+    "pts": fmt_pts,
+    "num": fmt_num,
+    "txt": lambda v: NA_TEXT if v is None or (isinstance(v, float) and not np.isfinite(v)) else str(v),
+}
+
+
+def format_table(frame: pd.DataFrame, formats: Dict[str, str]) -> pd.DataFrame:
+    """Return a display-ready copy of a numeric frame using the given formats."""
+    out = pd.DataFrame(index=frame.index)
+    for column in frame.columns:
+        kind = formats.get(column, "txt")
+        formatter = FORMATTERS.get(kind, FORMATTERS["txt"])
+        out[column] = [formatter(v) for v in frame[column]]
+    return out
+
+
+# =============================================================================
+# 3. WORKBOOK LOADING, VALIDATION & CLEANING
+# =============================================================================
+
+def _build_column_index(frame: pd.DataFrame) -> Dict[str, int]:
+    """Map normalised column keys to positional index (first occurrence wins)."""
+    index: Dict[str, int] = {}
+    for position, column in enumerate(frame.columns):
+        for key in (_norm_key(column), _squash_key(column)):
+            if key and key not in index:
+                index[key] = position
+    return index
+
+
+def _resolve_column(index: Dict[str, int], aliases: Sequence[str]) -> Optional[int]:
+    for alias in aliases:
+        for key in (_norm_key(alias), _squash_key(alias)):
+            if key in index:
+                return index[key]
+    return None
+
+
+def _expected_header_keys() -> set:
+    keys = set()
+    for spec in COLUMN_SPEC.values():
+        for aliases in spec.values():
+            for alias in aliases:
+                keys.add(_norm_key(alias))
+    for aliases in META_ALIASES.values():
+        for alias in aliases:
+            keys.add(_norm_key(alias))
+    return keys
+
+
+def _detect_header_row(raw: pd.DataFrame, max_scan: int = 15) -> int:
+    """Find the row that actually holds the column headers."""
+    expected = _expected_header_keys()
+    best_row, best_score = 0, -1
+    for row in range(min(max_scan, len(raw))):
+        values = {_norm_key(v) for v in raw.iloc[row].tolist() if str(v).strip().lower() != "nan"}
+        score = len(values & expected)
+        if score > best_score:
+            best_row, best_score = row, score
+    return best_row if best_score >= 4 else 0
+
+
+def _match_sheet(available: Sequence[str], aliases: Sequence[str]) -> Optional[str]:
+    normalised = {_norm_key(s): s for s in available}
+    for alias in aliases:
+        key = _norm_key(alias)
+        if key in normalised:
+            return normalised[key]
+    for alias in aliases:
+        key = _norm_key(alias)
+        for sheet_key, sheet in normalised.items():
+            if key in sheet_key:
+                return sheet
+    return None
+
+
+def validate_frame(frame: pd.DataFrame, index: Dict[str, int], sheet_label: str) -> List[str]:
+    """Return a list of human-readable descriptions of missing required columns."""
+    missing: List[str] = []
+    for (sales, asset), spec in COLUMN_SPEC.items():
+        for role, aliases in spec.items():
+            if _resolve_column(index, aliases) is None:
+                role_label = {"fy": "FY target", "ytd_tgt": "YTD June target", "ach": "YTD June achievement"}[role]
+                missing.append(
+                    f"{sheet_label} · {SALES_LABEL[sales]} · {asset} {role_label} "
+                    f"(expected column '{aliases[0]}')"
+                )
+    return missing
+
+
+def _extract_records(frame: pd.DataFrame, vertical: str) -> pd.DataFrame:
+    """Turn one workbook sheet into a tidy per-employee record frame."""
+    index = _build_column_index(frame)
+    records = pd.DataFrame(index=frame.index)
+    records["Vertical"] = vertical
+
+    for field, aliases in META_ALIASES.items():
+        position = _resolve_column(index, aliases)
+        if position is None:
+            records[field] = ""
+        else:
+            records[field] = as_text(frame.iloc[:, position]).to_numpy()
+
+    for (sales, asset), spec in COLUMN_SPEC.items():
+        for role, aliases in spec.items():
+            position = _resolve_column(index, aliases)
+            series = frame.iloc[:, position] if position is not None else None
+            records[f"{sales}_{asset}_{role}"] = clean_numeric(series).to_numpy()
+
+    return records
+
+
+def _clean_records(records: pd.DataFrame) -> pd.DataFrame:
+    """Drop non-employee rows while preserving legitimate negative values."""
+    names = text_column(records, "Employee Name").str.casefold()
+    invalid = names.isin({"", "nan", "none", "total", "grand total", "sum", "subtotal"})
+    numeric_columns = [c for c in records.columns if c.split("_")[0] in SALES_TYPES]
+    empty_rows = records[numeric_columns].isna().all(axis=1)
+    cleaned = records.loc[~(invalid | empty_rows)].copy()
+    cleaned[numeric_columns] = cleaned[numeric_columns].fillna(0.0)
+    return cleaned.reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False)
+def load_workbook(payload: bytes) -> pd.DataFrame:
+    """Read, validate and clean the workbook into a single tidy record frame."""
+    try:
+        excel = pd.ExcelFile(io.BytesIO(payload), engine="openpyxl")
+    except Exception as exc:  # pragma: no cover - defensive
+        raise WorkbookError(
+            "The file could not be opened as an Excel workbook. "
+            "Please upload a valid .xlsx file."
+        ) from exc
+
+    available = list(excel.sheet_names)
+    resolved: Dict[str, str] = {}
+    for vertical, aliases in SHEET_ALIASES.items():
+        sheet = _match_sheet(available, aliases)
+        if sheet is not None:
+            resolved[vertical] = sheet
+
+    missing_sheets = [v for v in SHEET_ALIASES if v not in resolved]
+    if missing_sheets:
+        wanted = ", ".join(f"'{SHEET_ALIASES[v][0]}'" for v in missing_sheets)
+        raise WorkbookError(
+            f"The workbook is missing the required calculation sheet(s): {wanted}. "
+            "Please upload the standard RM scorecard workbook."
+        )
+
+    frames: List[pd.DataFrame] = []
+    problems: List[str] = []
+    for vertical, sheet in resolved.items():
+        raw = pd.read_excel(excel, sheet_name=sheet, header=None, nrows=20)
+        header_row = _detect_header_row(raw)
+        frame = normalize_frame(pd.read_excel(excel, sheet_name=sheet, header=header_row))
+        index = _build_column_index(frame)
+        problems.extend(validate_frame(frame, index, vertical))
+        if not problems:
+            frames.append(_extract_records(frame, vertical))
+
+    if problems:
+        raise WorkbookError(
+            "The workbook is missing required columns:\n\n- " + "\n- ".join(problems[:12])
+            + ("\n- …" if len(problems) > 12 else "")
+        )
+
+    records = _clean_records(pd.concat(frames, ignore_index=True))
+    if records.empty:
+        raise WorkbookError("No employee records were found in the calculation sheets.")
+    return records
+
+
+
+# =============================================================================
+# 3A. FINAL SHEET — MANAGEMENT DASHBOARD VIEW
+# =============================================================================
+
+def _find_final_sheet_name(sheet_names: Sequence[str]) -> Optional[str]:
+    """Resolve the sixth workbook sheet named FINAL."""
+    return _match_sheet(sheet_names, FINAL_SHEET_ALIASES)
+
+
+def _excel_rgb(color: Any) -> Optional[str]:
+    """Convert an openpyxl RGB colour to a CSS hex colour when possible."""
+    try:
+        if color is None or color.type != "rgb" or not color.rgb:
+            return None
+        raw = str(color.rgb)
+        rgb = raw[-6:]
+        if len(rgb) == 6 and all(ch in "0123456789abcdefABCDEF" for ch in rgb):
+            return f"#{rgb}"
+    except Exception:
+        return None
+    return None
+
+
+def _display_excel_value(value: Any, number_format: str = "") -> str:
+    """Format Excel values for the FINAL dashboard without exposing formulas."""
+    if value is None:
+        return ""
+
+    if isinstance(value, (pd.Timestamp,)):
+        return value.strftime("%d-%b-%Y")
+
+    # Date/datetime objects from openpyxl.
+    if hasattr(value, "strftime") and not isinstance(value, str):
+        try:
+            return value.strftime("%d-%b-%Y")
+        except Exception:
+            pass
+
+    if isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, bool):
+        numeric = float(value)
+        if not np.isfinite(numeric):
+            return ""
+
+        fmt = str(number_format or "")
+        if "%" in fmt:
+            # Excel stores percentages as fractions.
+            decimals = 0
+            if "." in fmt.split("%")[0]:
+                decimals = len(fmt.split("%")[0].split(".")[-1].replace("0", "0"))
+            decimals = min(max(decimals, 0), 2)
+            return f"{numeric * 100:,.{decimals}f}%"
+
+        # Respect accounting-style parentheses when possible.
+        negative_parentheses = numeric < 0 and "(" in fmt and ")" in fmt
+        abs_value = abs(numeric)
+
+        if abs(abs_value - round(abs_value)) < 1e-9:
+            rendered = f"{abs_value:,.0f}"
+        else:
+            rendered = f"{abs_value:,.2f}".rstrip("0").rstrip(".")
+
+        if numeric < 0:
+            return f"({rendered})" if negative_parentheses else f"-{rendered}"
+        return rendered
+
+    return str(value)
+
+
+@st.cache_data(show_spinner=False)
+def load_final_sheet_frame(payload: bytes) -> pd.DataFrame:
     """
-    Fix Equity at equity_multiplier and make total target equal
-    overall_multiplier by distributing the remaining target between
-    Debt and Liquid in proportion to their FY targets.
+    Read the FINAL sheet as raw cells for a fallback / inspection table.
+
+    The sheet intentionally has no single header row, so header=None is used.
     """
-    total_target = eq_target + debt_target + liq_target
-    required_total = overall_multiplier * total_target
-    required_equity = equity_multiplier * eq_target
+    excel = pd.ExcelFile(io.BytesIO(payload), engine="openpyxl")
+    sheet = _find_final_sheet_name(excel.sheet_names)
+    if sheet is None:
+        raise WorkbookError(
+            "The workbook does not contain the sixth sheet 'FINAL'. "
+            "Please upload the workbook that contains Summary, Summary-Achievement, "
+            "RM Retail Sales, RM DHNI, VRM and FINAL."
+        )
 
-    remaining = (required_total - required_equity).clip(lower=0)
-    non_eq_base = debt_target + liq_target
-
-    debt_share = np.where(
-        non_eq_base > 0,
-        debt_target / non_eq_base,
-        0.0,
-    )
-    liq_share = np.where(
-        non_eq_base > 0,
-        liq_target / non_eq_base,
-        0.0,
-    )
-
-    debt_final = remaining * debt_share
-    liq_final = remaining * liq_share
-
-    return required_equity, pd.Series(debt_final, index=eq_target.index), pd.Series(
-        liq_final, index=eq_target.index
-    )
+    frame = pd.read_excel(excel, sheet_name=sheet, header=None)
+    frame = frame.dropna(axis=0, how="all").dropna(axis=1, how="all")
+    return frame.reset_index(drop=True)
 
 
-def component_target_amounts(
-    df: pd.DataFrame,
-    prefix: str,
-    scenario: str,
-    assumptions: Dict[str, float],
-) -> Tuple[pd.Series, pd.Series, pd.Series]:
+@st.cache_data(show_spinner=False)
+def build_final_sheet_html(payload: bytes) -> str:
     """
-    Returns final target amounts for Equity, Debt and Liquid.
+    Render the Excel FINAL sheet into a scrollable HTML table.
 
-    prefix == "GS" uses Gross Sales columns.
-    prefix == "NS" uses Net Sales columns.
+    This keeps merged headings and the workbook's basic font/fill/alignment
+    styling, while using cached formula results (data_only=True).
     """
-    if prefix == "GS":
-        eq_tgt = clean_numeric(df["FY 26 TGT EQ"])
-        dt_tgt = clean_numeric(df["FY 26 TGT DT"])
-        liq_tgt = clean_numeric(df["FY 26 TGT LIQ"])
-    else:
-        eq_tgt = clean_numeric(df["FY 26 TGT EQ NS"])
-        dt_tgt = clean_numeric(df["FY 26 TGT DT NS"])
-        liq_tgt = clean_numeric(df["FY 26 TGT LIQ NS"])
-
-    if scenario == "Scenario 1":
-        multiplier = assumptions["scenario1_overall"]
-        return (
-            eq_tgt * multiplier,
-            dt_tgt * multiplier,
-            liq_tgt * multiplier,
+    workbook = openpyxl_load_workbook(io.BytesIO(payload), data_only=True)
+    sheet_name = _find_final_sheet_name(workbook.sheetnames)
+    if sheet_name is None:
+        raise WorkbookError(
+            "The workbook does not contain the sixth sheet 'FINAL'. "
+            "Please upload the workbook that contains the FINAL dashboard sheet."
         )
 
-    if scenario == "Scenario 2":
-        multiplier = assumptions["scenario2_overall"]
-        return (
-            eq_tgt * multiplier,
-            dt_tgt * multiplier,
-            liq_tgt * multiplier,
-        )
+    ws = workbook[sheet_name]
 
-    if scenario == "Scenario 3":
-        return proportional_non_equity_targets(
-            eq_tgt,
-            dt_tgt,
-            liq_tgt,
-            assumptions["scenario3_equity"],
-            assumptions["scenario3_overall"],
-        )
-
-    # Scenario 4:
-    # Equity is fixed at 110% by default.
-    # Debt + Liquid are balanced proportionally so total reaches
-    # the minimum overall target (85% by default).
-    return proportional_non_equity_targets(
-        eq_tgt,
-        dt_tgt,
-        liq_tgt,
-        assumptions["scenario4_equity"],
-        assumptions["scenario4_overall_min"],
-    )
-
-
-def current_run_rate_projection(
-    achievement: pd.Series,
-    fy_target: pd.Series,
-    months_completed: int,
-) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    """Annualise current YTD pace without applying any scenario assumption."""
-    completed = max(int(months_completed), 1)
-    monthly_run_rate = achievement / completed
-    projected_fy_achievement = monthly_run_rate * 12
-    projected_fy_percent = pd.Series(
-        np.where(fy_target > 0, projected_fy_achievement / fy_target, 0.0),
-        index=achievement.index,
-    )
-    return monthly_run_rate, projected_fy_achievement, projected_fy_percent
-
-
-
-def calculate_scenario(
-    df: pd.DataFrame,
-    scenario: str,
-    months_remaining: int,
-    assumptions: Dict[str, float],
-) -> pd.DataFrame:
-    result = pd.DataFrame(index=df.index)
-
-    for column in METADATA_COLUMNS:
-        if column in df.columns:
-            result[column] = df[column]
-
-    if "Employee Name" not in result.columns:
-        result["Employee Name"] = df["Employee Name"].astype(str)
-
-    months = max(int(months_remaining), 1)
-    months_completed = max(12 - int(months_remaining), 1)
-
-    # ---------------- Current Run Rate Forecast ----------------
-    # No management scenario is imposed. Actual YTD performance is
-    # annualised at the employee's current monthly pace.
-    if scenario == FORECAST_NAME:
-        # Gross Sales
-        gs_eq_tgt = clean_numeric(df["FY 26 TGT EQ"])
-        gs_dt_tgt = clean_numeric(df["FY 26 TGT DT"])
-        gs_liq_tgt = clean_numeric(df["FY 26 TGT LIQ"])
-
-        gs_eq_ach = clean_numeric(df["Equity GS Ach YTD June"])
-        gs_dt_ach = clean_numeric(df["Debt GS Ach"])
-        gs_liq_ach = clean_numeric(df["Liquid GS Ach"])
-
-        gs_eq_rr, gs_eq_proj, gs_eq_pct = current_run_rate_projection(
-            gs_eq_ach, gs_eq_tgt, months_completed
-        )
-        gs_dt_rr, gs_dt_proj, gs_dt_pct = current_run_rate_projection(
-            gs_dt_ach, gs_dt_tgt, months_completed
-        )
-        gs_liq_rr, gs_liq_proj, gs_liq_pct = current_run_rate_projection(
-            gs_liq_ach, gs_liq_tgt, months_completed
-        )
-
-        result["GS Equity FY Target"] = gs_eq_tgt
-        result["GS Equity YTD Achievement"] = gs_eq_ach
-        result["GS Equity Current Run Rate / Month"] = gs_eq_rr
-        result["GS Equity Projected FY Achievement"] = gs_eq_proj
-        result["GS Equity Projected FY %"] = gs_eq_pct
-
-        result["GS Debt FY Target"] = gs_dt_tgt
-        result["GS Debt YTD Achievement"] = gs_dt_ach
-        result["GS Debt Current Run Rate / Month"] = gs_dt_rr
-        result["GS Debt Projected FY Achievement"] = gs_dt_proj
-        result["GS Debt Projected FY %"] = gs_dt_pct
-
-        result["GS Liquid FY Target"] = gs_liq_tgt
-        result["GS Liquid YTD Achievement"] = gs_liq_ach
-        result["GS Liquid Current Run Rate / Month"] = gs_liq_rr
-        result["GS Liquid Projected FY Achievement"] = gs_liq_proj
-        result["GS Liquid Projected FY %"] = gs_liq_pct
-
-        result["GS Total FY Target"] = gs_eq_tgt + gs_dt_tgt + gs_liq_tgt
-        result["GS Total YTD Achievement"] = gs_eq_ach + gs_dt_ach + gs_liq_ach
-        result["GS Total Current Run Rate / Month"] = gs_eq_rr + gs_dt_rr + gs_liq_rr
-        result["GS Total Projected FY Achievement"] = gs_eq_proj + gs_dt_proj + gs_liq_proj
-        result["GS Overall Projected FY %"] = np.where(
-            result["GS Total FY Target"] > 0,
-            result["GS Total Projected FY Achievement"] / result["GS Total FY Target"],
-            0.0,
-        )
-
-        # Net Sales
-        ns_eq_tgt = clean_numeric(df["FY 26 TGT EQ NS"])
-        ns_dt_tgt = clean_numeric(df["FY 26 TGT DT NS"])
-        ns_liq_tgt = clean_numeric(df["FY 26 TGT LIQ NS"])
-
-        ns_eq_ach = clean_numeric(df["Equity NS Ach YTD June"])
-        ns_dt_ach = clean_numeric(df["Debt NS Ach"])
-        ns_liq_ach = clean_numeric(df["Liquid NS Ach"])
-
-        ns_eq_rr, ns_eq_proj, ns_eq_pct = current_run_rate_projection(
-            ns_eq_ach, ns_eq_tgt, months_completed
-        )
-        ns_dt_rr, ns_dt_proj, ns_dt_pct = current_run_rate_projection(
-            ns_dt_ach, ns_dt_tgt, months_completed
-        )
-        ns_liq_rr, ns_liq_proj, ns_liq_pct = current_run_rate_projection(
-            ns_liq_ach, ns_liq_tgt, months_completed
-        )
-
-        result["NS Equity FY Target"] = ns_eq_tgt
-        result["NS Equity YTD Achievement"] = ns_eq_ach
-        result["NS Equity Current Run Rate / Month"] = ns_eq_rr
-        result["NS Equity Projected FY Achievement"] = ns_eq_proj
-        result["NS Equity Projected FY %"] = ns_eq_pct
-
-        result["NS Debt FY Target"] = ns_dt_tgt
-        result["NS Debt YTD Achievement"] = ns_dt_ach
-        result["NS Debt Current Run Rate / Month"] = ns_dt_rr
-        result["NS Debt Projected FY Achievement"] = ns_dt_proj
-        result["NS Debt Projected FY %"] = ns_dt_pct
-
-        result["NS Liquid FY Target"] = ns_liq_tgt
-        result["NS Liquid YTD Achievement"] = ns_liq_ach
-        result["NS Liquid Current Run Rate / Month"] = ns_liq_rr
-        result["NS Liquid Projected FY Achievement"] = ns_liq_proj
-        result["NS Liquid Projected FY %"] = ns_liq_pct
-
-        result["NS Total FY Target"] = ns_eq_tgt + ns_dt_tgt + ns_liq_tgt
-        result["NS Total YTD Achievement"] = ns_eq_ach + ns_dt_ach + ns_liq_ach
-        result["NS Total Current Run Rate / Month"] = ns_eq_rr + ns_dt_rr + ns_liq_rr
-        result["NS Total Projected FY Achievement"] = ns_eq_proj + ns_dt_proj + ns_liq_proj
-        result["NS Overall Projected FY %"] = np.where(
-            result["NS Total FY Target"] > 0,
-            result["NS Total Projected FY Achievement"] / result["NS Total FY Target"],
-            0.0,
-        )
-
-        result["Scenario"] = scenario
-        result["Months Completed"] = months_completed
-        result["Months Remaining"] = int(months_remaining)
-        return result
-
-    # ---------------- Scenario planning: Gross Sales ----------------
-    gs_eq_final, gs_dt_final, gs_liq_final = component_target_amounts(
-        df, "GS", scenario, assumptions
-    )
-
-    gs_eq_ach = clean_numeric(df["Equity GS Ach YTD June"])
-    gs_dt_ach = clean_numeric(df["Debt GS Ach"])
-    gs_liq_ach = clean_numeric(df["Liquid GS Ach"])
-
-    result["GS Equity Final Target"] = gs_eq_final
-    result["GS Debt Final Target"] = gs_dt_final
-    result["GS Liquid Final Target"] = gs_liq_final
-
-    result["GS Equity Required / Month"] = (
-        (gs_eq_final - gs_eq_ach).clip(lower=0) / months
-    )
-    result["GS Debt Required / Month"] = (
-        (gs_dt_final - gs_dt_ach).clip(lower=0) / months
-    )
-    result["GS Liquid Required / Month"] = (
-        (gs_liq_final - gs_liq_ach).clip(lower=0) / months
-    )
-
-    result["GS Total Required / Month"] = (
-        result["GS Equity Required / Month"]
-        + result["GS Debt Required / Month"]
-        + result["GS Liquid Required / Month"]
-    )
-
-    gs_fy_total = (
-        clean_numeric(df["FY 26 TGT EQ"])
-        + clean_numeric(df["FY 26 TGT DT"])
-        + clean_numeric(df["FY 26 TGT LIQ"])
-    )
-    gs_final_total = gs_eq_final + gs_dt_final + gs_liq_final
-    result["GS Scenario Overall %"] = np.where(
-        gs_fy_total > 0, gs_final_total / gs_fy_total, 0
-    )
-
-    # ---------------- Scenario planning: Net Sales ----------------
-    ns_eq_final, ns_dt_final, ns_liq_final = component_target_amounts(
-        df, "NS", scenario, assumptions
-    )
-
-    ns_eq_ach = clean_numeric(df["Equity NS Ach YTD June"])
-    ns_dt_ach = clean_numeric(df["Debt NS Ach"])
-    ns_liq_ach = clean_numeric(df["Liquid NS Ach"])
-
-    result["NS Equity Final Target"] = ns_eq_final
-    result["NS Debt Final Target"] = ns_dt_final
-    result["NS Liquid Final Target"] = ns_liq_final
-
-    result["NS Equity Required / Month"] = (
-        (ns_eq_final - ns_eq_ach).clip(lower=0) / months
-    )
-    result["NS Debt Required / Month"] = (
-        (ns_dt_final - ns_dt_ach).clip(lower=0) / months
-    )
-    result["NS Liquid Required / Month"] = (
-        (ns_liq_final - ns_liq_ach).clip(lower=0) / months
-    )
-
-    result["NS Total Required / Month"] = (
-        result["NS Equity Required / Month"]
-        + result["NS Debt Required / Month"]
-        + result["NS Liquid Required / Month"]
-    )
-
-    ns_fy_total = (
-        clean_numeric(df["FY 26 TGT EQ NS"])
-        + clean_numeric(df["FY 26 TGT DT NS"])
-        + clean_numeric(df["FY 26 TGT LIQ NS"])
-    )
-    ns_final_total = ns_eq_final + ns_dt_final + ns_liq_final
-    result["NS Scenario Overall %"] = np.where(
-        ns_fy_total > 0, ns_final_total / ns_fy_total, 0
-    )
-
-    result["Scenario"] = scenario
-    result["Months Completed"] = months_completed
-    result["Months Remaining"] = months
-    return result
-
-
-def calculate_all_scenarios(
-    df: pd.DataFrame,
-    months_remaining: int,
-    assumptions: Dict[str, float],
-) -> pd.DataFrame:
-    frames = [
-        calculate_scenario(df, scenario, months_remaining, assumptions)
-        for scenario in SCENARIO_NAMES
+    # Find the real content boundary from non-empty values rather than Excel's
+    # formatted used-range, which can extend thousands of blank rows/columns.
+    non_empty = [
+        (cell.row, cell.column)
+        for row in ws.iter_rows()
+        for cell in row
+        if cell.value not in (None, "")
     ]
-    return pd.concat(frames, ignore_index=True)
+    if not non_empty:
+        return "<div class='note'>The FINAL sheet is empty.</div>"
+
+    min_row = min(r for r, _ in non_empty)
+    max_row = max(r for r, _ in non_empty)
+    min_col = min(c for _, c in non_empty)
+    max_col = max(c for _, c in non_empty)
+
+    # Merged-cell lookup.
+    merge_anchor: Dict[Tuple[int, int], Tuple[int, int]] = {}
+    merge_covered: set = set()
+    for merged in ws.merged_cells.ranges:
+        # Only consider merged ranges intersecting the content boundary.
+        if (
+            merged.max_row < min_row or merged.min_row > max_row
+            or merged.max_col < min_col or merged.min_col > max_col
+        ):
+            continue
+        anchor = (merged.min_row, merged.min_col)
+        merge_anchor[anchor] = (
+            merged.max_row - merged.min_row + 1,
+            merged.max_col - merged.min_col + 1,
+        )
+        for rr in range(merged.min_row, merged.max_row + 1):
+            for cc in range(merged.min_col, merged.max_col + 1):
+                if (rr, cc) != anchor:
+                    merge_covered.add((rr, cc))
+
+    html_parts = [
+        """
+        <div style="
+            overflow-x:auto;
+            overflow-y:auto;
+            max-height:78vh;
+            border:1px solid #C9A85B;
+            border-radius:12px;
+            background:#FFFDF7;
+            padding:4px;
+        ">
+        <table style="
+            border-collapse:collapse;
+            width:max-content;
+            min-width:100%;
+            font-family:Arial, sans-serif;
+            font-size:12px;
+            color:#0f172a;
+        ">
+        """
+    ]
+
+    for row_idx in range(min_row, max_row + 1):
+        row_values = [
+            ws.cell(row=row_idx, column=col_idx).value
+            for col_idx in range(min_col, max_col + 1)
+        ]
+
+        # Keep dashboard spacing, but collapse very large blank areas to a
+        # single slim spacer row.
+        if all(v in (None, "") for v in row_values):
+            html_parts.append(
+                "<tr><td colspan='{}' style='height:8px;border:none;background:#FFFDF7;'></td></tr>"
+                .format(max_col - min_col + 1)
+            )
+            continue
+
+        html_parts.append("<tr>")
+        for col_idx in range(min_col, max_col + 1):
+            if (row_idx, col_idx) in merge_covered:
+                continue
+
+            cell = ws.cell(row=row_idx, column=col_idx)
+            rowspan, colspan = merge_anchor.get((row_idx, col_idx), (1, 1))
+
+            value = _display_excel_value(cell.value, cell.number_format)
+            font_color = _excel_rgb(cell.font.color)
+            fill_color = _excel_rgb(cell.fill.fgColor)
+
+            styles = [
+                "border:1px solid #E4D4AA",
+                "padding:5px 7px",
+                "min-width:78px",
+                "white-space:nowrap",
+                "vertical-align:middle",
+                "background:#FFFDF7",
+            ]
+
+            if fill_color and fill_color.lower() not in {"#000000", "#ffffff"}:
+                styles.append(f"background:{fill_color}")
+            if font_color:
+                styles.append(f"color:{font_color}")
+            if cell.font.bold:
+                styles.append("font-weight:700")
+            if cell.font.italic:
+                styles.append("font-style:italic")
+
+            horizontal = getattr(cell.alignment, "horizontal", None)
+            if horizontal in {"center", "centerContinuous"}:
+                styles.append("text-align:center")
+            elif horizontal == "right":
+                styles.append("text-align:right")
+            else:
+                styles.append("text-align:left")
+
+            attrs = []
+            if rowspan > 1:
+                attrs.append(f"rowspan='{rowspan}'")
+            if colspan > 1:
+                attrs.append(f"colspan='{colspan}'")
+
+            html_parts.append(
+                f"<td {' '.join(attrs)} style=\"{';'.join(styles)}\">"
+                f"{escape(value)}"
+                "</td>"
+            )
+        html_parts.append("</tr>")
+
+    html_parts.append("</table></div>")
+    return "".join(html_parts)
 
 
-def make_download_excel(
-    original_df: pd.DataFrame,
-    selected_result: pd.DataFrame,
-    all_results: pd.DataFrame,
-    assumptions: Dict[str, float],
-    selected_scenario: str,
-    months_remaining: int,
-) -> bytes:
-    output = io.BytesIO()
-    months_completed = max(12 - int(months_remaining), 1)
+FINAL_METRIC_ROWS: List[str] = [
+    "Overall", "Equity", "Debt", "Liquid",
+    "Retail", "DHNI", "VRM", "Insti", "Digital",
+    "Alternatives", "Passives",
+]
 
-    control_df = pd.DataFrame(
-        {
-            "Setting": [
-                "Selected Case",
-                "Months Completed",
-                "Months Remaining",
-                "Scenario 1 Overall Target",
-                "Scenario 2 Overall Target",
-                "Scenario 3 Equity Target",
-                "Scenario 3 Overall Target",
-                "Scenario 4 Equity Target",
-                "Scenario 4 Minimum Overall",
-            ],
-            "Value": [
-                selected_scenario,
-                months_completed,
-                months_remaining,
-                assumptions["scenario1_overall"],
-                assumptions["scenario2_overall"],
-                assumptions["scenario3_equity"],
-                assumptions["scenario3_overall"],
-                assumptions["scenario4_equity"],
-                assumptions["scenario4_overall_min"],
-            ],
-        }
+
+def _final_key(value: Any) -> str:
+    return " ".join(str(value or "").replace("\u00a0", " ").strip().split()).lower()
+
+
+def _final_number(value: Any) -> Optional[float]:
+    """Convert FINAL-sheet numeric / accounting text into float."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, bool):
+        numeric = float(value)
+        return numeric if np.isfinite(numeric) else None
+
+    raw = str(value).strip()
+    if not raw or raw.lower() in {"-", "—", "na", "n/a", "none", "nan", "#div/0!"}:
+        return None
+
+    negative = raw.startswith("(") and raw.endswith(")")
+    cleaned = (
+        raw.replace(",", "")
+        .replace("₹", "")
+        .replace("%", "")
+        .replace("(", "")
+        .replace(")", "")
+        .strip()
+    )
+    try:
+        numeric = float(cleaned)
+    except ValueError:
+        return None
+    if negative:
+        numeric = -numeric
+    return numeric
+
+
+def _final_known_label(value: Any) -> Optional[str]:
+    key = _final_key(value)
+    aliases = {
+        "overall": "Overall",
+        "equity": "Equity",
+        "debt": "Debt",
+        "liquid": "Liquid",
+        "retail": "Retail",
+        "dhni": "DHNI",
+        "vrm": "VRM",
+        "insti": "Insti",
+        "institutional": "Insti",
+        "digital": "Digital",
+        "alternatives": "Alternatives",
+        "alternate": "Alternatives",
+        "passives": "Passives",
+        "passive": "Passives",
+    }
+    return aliases.get(key)
+
+
+def _scan_final_sheet(ws: Any) -> Tuple[int, int]:
+    """Cap the scan to the management-dashboard area, not formatted blank Excel space."""
+    return min(max(ws.max_row, 1), 320), min(max(ws.max_column, 1), 180)
+
+
+def _find_final_cells(ws: Any, wanted: str) -> List[Tuple[int, int]]:
+    wanted_key = _final_key(wanted)
+    max_row, max_col = _scan_final_sheet(ws)
+    found: List[Tuple[int, int]] = []
+    for row in range(1, max_row + 1):
+        for col in range(1, max_col + 1):
+            if _final_key(ws.cell(row=row, column=col).value) == wanted_key:
+                found.append((row, col))
+    return found
+
+
+def _find_header_near(
+    ws: Any,
+    title_position: Tuple[int, int],
+    header_name: str,
+    row_window: int = 8,
+    col_before: int = 4,
+    col_after: int = 24,
+) -> Optional[Tuple[int, int]]:
+    title_row, title_col = title_position
+    max_row, max_col = _scan_final_sheet(ws)
+    wanted = _final_key(header_name)
+    for row in range(title_row, min(title_row + row_window, max_row) + 1):
+        start_col = max(1, title_col - col_before)
+        end_col = min(max_col, title_col + col_after)
+        for col in range(start_col, end_col + 1):
+            if _final_key(ws.cell(row=row, column=col).value) == wanted:
+                return row, col
+    return None
+
+
+def _augment_final_runrate(frame: pd.DataFrame, months_done: int) -> pd.DataFrame:
+    """Recreate the run-rate formulas shown in FINAL from Target and YTD."""
+    if frame.empty:
+        return frame
+
+    months = max(int(months_done), 1)
+    out = frame.copy()
+    out["FY27 Target"] = pd.to_numeric(out["FY27 Target"], errors="coerce")
+    out["YTD"] = pd.to_numeric(out["YTD"], errors="coerce")
+
+    out["Achievement %"] = np.where(
+        (out["FY27 Target"] > 0) & (out["YTD"] >= 0),
+        out["YTD"] / out["FY27 Target"],
+        np.nan,
+    )
+    out["Current RR"] = out["YTD"] / months
+
+    # This matches the FINAL workbook screenshot:
+    # 154,757 / 12 = 12,896; 20,699 / 12 = 1,725.
+    out["Required RR to Target"] = out["FY27 Target"] / 12.0
+
+    # Annualise the current Apr-Jun run rate to a full 12-month FY.
+    out["Estimated FY @ Current RR"] = out["Current RR"] * 12.0
+    out["Projected FY %"] = np.where(
+        (out["FY27 Target"] > 0) & (out["Estimated FY @ Current RR"] >= 0),
+        out["Estimated FY @ Current RR"] / out["FY27 Target"],
+        np.nan,
+    )
+    return out
+
+
+def _parse_final_sales_block(ws: Any, title: str, months_done: int) -> pd.DataFrame:
+    """Parse the NET SALES / GROSS SALES run-rate block on the FINAL sheet."""
+    positions = _find_final_cells(ws, title)
+    for position in positions:
+        header = _find_header_near(ws, position, "FY27 Target")
+        if header is None:
+            continue
+
+        header_row, target_col = header
+
+        # In the FINAL block the row label sits immediately to the left of FY27 Target.
+        label_col = max(1, target_col - 1)
+        ytd_col = target_col + 1
+
+        rows: List[Dict[str, Any]] = []
+        seen: set = set()
+        max_row, _ = _scan_final_sheet(ws)
+
+        for row in range(header_row + 1, min(header_row + 28, max_row) + 1):
+            label = _final_known_label(ws.cell(row=row, column=label_col).value)
+            if label is None or label in seen:
+                continue
+
+            target = _final_number(ws.cell(row=row, column=target_col).value)
+            ytd = _final_number(ws.cell(row=row, column=ytd_col).value)
+
+            # Ignore title/spacer rows accidentally matching a label.
+            if target is None and ytd is None:
+                continue
+
+            rows.append({"Metric": label, "FY27 Target": target, "YTD": ytd})
+            seen.add(label)
+
+        if rows:
+            frame = pd.DataFrame(rows).set_index("Metric")
+            order = [label for label in FINAL_METRIC_ROWS if label in frame.index]
+            return _augment_final_runrate(frame.loc[order].reset_index(), months_done).set_index("Metric")
+
+    return pd.DataFrame()
+
+
+def _parse_final_aum_block(ws: Any) -> pd.DataFrame:
+    """Parse Target / Current AUM from the FINAL management sheet."""
+    positions = _find_final_cells(ws, "AUM")
+    for position in positions:
+        title_row, title_col = position
+        max_row, max_col = _scan_final_sheet(ws)
+
+        header_row = None
+        target_col = None
+        current_col = None
+
+        for row in range(title_row, min(title_row + 6, max_row) + 1):
+            for col in range(max(1, title_col - 4), min(max_col, title_col + 8) + 1):
+                if _final_key(ws.cell(row=row, column=col).value) == "target":
+                    # Find Current on the same header row.
+                    for cc in range(col + 1, min(max_col, col + 5) + 1):
+                        if _final_key(ws.cell(row=row, column=cc).value) == "current":
+                            header_row = row
+                            target_col = col
+                            current_col = cc
+                            break
+                if header_row is not None:
+                    break
+            if header_row is not None:
+                break
+
+        if header_row is None or target_col is None or current_col is None:
+            continue
+
+        label_col = max(1, target_col - 1)
+        rows: List[Dict[str, Any]] = []
+        seen: set = set()
+
+        for row in range(header_row + 1, min(header_row + 28, max_row) + 1):
+            label = _final_known_label(ws.cell(row=row, column=label_col).value)
+            if label is None or label in seen:
+                continue
+            target = _final_number(ws.cell(row=row, column=target_col).value)
+            current = _final_number(ws.cell(row=row, column=current_col).value)
+            if target is None and current is None:
+                continue
+            rows.append({"Metric": label, "Target": target, "Current": current})
+            seen.add(label)
+
+        if rows:
+            frame = pd.DataFrame(rows).set_index("Metric")
+            order = [label for label in FINAL_METRIC_ROWS if label in frame.index]
+            frame = frame.loc[order].copy()
+            frame["Achievement %"] = np.where(
+                (frame["Target"] > 0) & (frame["Current"] >= 0),
+                frame["Current"] / frame["Target"],
+                np.nan,
+            )
+            frame["Gap to Target"] = frame["Target"] - frame["Current"]
+            return frame
+
+    return pd.DataFrame()
+
+
+def _parse_months_done(ws: Any) -> int:
+    positions = (
+        _find_final_cells(ws, "#months done")
+        + _find_final_cells(ws, "months done")
+        + _find_final_cells(ws, "# months done")
+    )
+    max_row, max_col = _scan_final_sheet(ws)
+
+    for row, col in positions:
+        # Search immediately around / below the label for the red "3".
+        for rr in range(row, min(row + 4, max_row) + 1):
+            for cc in range(max(1, col - 2), min(max_col, col + 4) + 1):
+                value = _final_number(ws.cell(row=rr, column=cc).value)
+                if value is not None and 1 <= value <= 12:
+                    return int(round(value))
+    return MONTHS_COMPLETED
+
+
+@st.cache_data(show_spinner=False)
+def parse_final_dashboard_metrics(payload: bytes) -> Dict[str, Any]:
+    """Return structured management metrics from the workbook's FINAL sheet."""
+    workbook = openpyxl_load_workbook(io.BytesIO(payload), data_only=True)
+    sheet_name = _find_final_sheet_name(workbook.sheetnames)
+    if sheet_name is None:
+        raise WorkbookError(
+            "The workbook is missing the required sixth sheet 'FINAL'. "
+            "Please upload the workbook containing FINAL."
+        )
+
+    ws = workbook[sheet_name]
+    months_done = _parse_months_done(ws)
+
+    gs = _parse_final_sales_block(ws, "GROSS SALES", months_done)
+    ns = _parse_final_sales_block(ws, "NET SALES", months_done)
+    aum = _parse_final_aum_block(ws)
+
+    return {
+        "sheet_name": sheet_name,
+        "months_done": months_done,
+        "GS": gs,
+        "NS": ns,
+        "AUM": aum,
+    }
+
+
+def _model_metric_baseline(model: "ScenarioModel", sales: str, label: str) -> Dict[str, Any]:
+    if label == "Overall":
+        return model.baseline(sales)
+    if label in ASSETS:
+        return model.baseline(sales, asset=label)
+    if label in VERTICALS:
+        return model.baseline(sales, vertical=label)
+    return {}
+
+
+def _model_metric_cell(model: "ScenarioModel", sales: str, label: str) -> Optional[Dict[str, Any]]:
+    if label == "Overall":
+        return model.cell(sales)
+    if label in ASSETS:
+        return model.cell(sales, asset=label)
+    if label in VERTICALS:
+        return model.cell(sales, vertical=label)
+    return None
+
+
+def final_sales_metrics(
+    final_metrics: Dict[str, Any],
+    model: "ScenarioModel",
+    sales: str,
+) -> pd.DataFrame:
+    """
+    Use FINAL Target/YTD as the visible source of truth.
+    Fill modelled Overall/asset/vertical rows from the scenario data only if
+    the FINAL parser could not locate them.
+    """
+    parsed = final_metrics.get(sales)
+    if isinstance(parsed, pd.DataFrame) and not parsed.empty:
+        frame = parsed.copy()
+    else:
+        frame = pd.DataFrame()
+
+    months_done = int(final_metrics.get("months_done", MONTHS_COMPLETED))
+    needed = ["Overall", *ASSETS, *VERTICALS]
+
+    fallback_rows: List[Dict[str, Any]] = []
+    for label in needed:
+        if not frame.empty and label in frame.index:
+            continue
+        base = _model_metric_baseline(model, sales, label)
+        if not base:
+            continue
+        fallback_rows.append(
+            {
+                "Metric": label,
+                "FY27 Target": base.get("fy_target"),
+                "YTD": base.get("ytd_ach"),
+            }
+        )
+
+    if fallback_rows:
+        fallback = _augment_final_runrate(pd.DataFrame(fallback_rows), months_done).set_index("Metric")
+        if frame.empty:
+            frame = fallback
+        else:
+            frame = pd.concat([frame, fallback], axis=0)
+
+    if frame.empty:
+        return frame
+
+    # Preserve management ordering and avoid accidental duplicate rows.
+    frame = frame.loc[~frame.index.duplicated(keep="first")].copy()
+    order = [label for label in FINAL_METRIC_ROWS if label in frame.index]
+    return frame.loc[order]
+
+
+def build_final_scenario_comparison(
+    final_metrics: Dict[str, Any],
+    model: "ScenarioModel",
+    sales: str,
+) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """Scenario comparison expressed on the same Target/YTD/run-rate metrics as FINAL."""
+    current = final_sales_metrics(final_metrics, model, sales)
+    rows: List[Dict[str, Any]] = []
+
+    for label in current.index.tolist():
+        source = current.loc[label]
+        cell = _model_metric_cell(model, sales, label)
+
+        final_target = _num(source.get("FY27 Target"))
+        current_rr = _num(source.get("Current RR"))
+        current_projection = _num(source.get("Estimated FY @ Current RR"))
+        current_pct = _num(source.get("Projected FY %"))
+
+        model_base = _model_metric_baseline(model, sales, label)
+        model_target = _num(model_base.get("fy_target")) if model_base else None
+
+        scenario_pct = _num(cell.get("march_pct")) if cell is not None else None
+
+        scenario_amount = None
+        scenario_rr = None
+        rr_change = None
+        delta_pp = None
+
+        if cell is not None:
+            # Anchor the scenario outcome to the FINAL FY27 target so the
+            # management comparison uses one common metric base.
+            scenario_amount = (
+                final_target * scenario_pct
+                if final_target is not None and scenario_pct is not None
+                else _num(cell.get("march_amount"))
+            )
+
+            scenario_rr = _num(cell.get("scen_rr"))
+            if (
+                scenario_rr is not None
+                and final_target is not None
+                and model_target is not None
+                and model_target != 0
+            ):
+                scenario_rr = scenario_rr * final_target / model_target
+
+            if current_rr is not None and scenario_rr is not None and current_rr != 0:
+                rr_change = scenario_rr / current_rr - 1.0
+
+            if current_pct is not None and scenario_pct is not None:
+                delta_pp = scenario_pct - current_pct
+
+        rows.append(
+            {
+                "Metric": label,
+                "FY27 Target": final_target,
+                "YTD": _num(source.get("YTD")),
+                "Current RR": current_rr,
+                "Required RR to Target": _num(source.get("Required RR to Target")),
+                "Current FY Estimate": current_projection,
+                "Current Projected %": current_pct,
+                "Scenario / Required RR": scenario_rr,
+                "Run Rate Change %": rr_change,
+                "Scenario March Estimate": scenario_amount,
+                "Scenario March %": scenario_pct,
+                "Scenario Δ pp": delta_pp,
+            }
+        )
+
+    formats = {
+        "Metric": "txt",
+        "FY27 Target": "cr",
+        "YTD": "cr",
+        "Current RR": "cr",
+        "Required RR to Target": "cr",
+        "Current FY Estimate": "cr",
+        "Current Projected %": "pct",
+        "Scenario / Required RR": "cr",
+        "Run Rate Change %": "pct_signed",
+        "Scenario March Estimate": "cr",
+        "Scenario March %": "pct",
+        "Scenario Δ pp": "pts",
+    }
+    return pd.DataFrame(rows), formats
+
+
+FINAL_ASSET_ROWS: List[str] = ["Equity", "Debt", "Liquid"]
+FINAL_CHANNEL_ROWS: List[str] = [
+    "Retail", "DHNI", "VRM", "Insti", "Digital", "Alternatives", "Passives",
+]
+
+
+def _render_metric_bifurcation(
+    frame: pd.DataFrame,
+    formats: Dict[str, str],
+    *,
+    metric_column: str = "Metric",
+) -> None:
+    """
+    Management-friendly table split:
+      • Overall
+      • Asset Class -> Equity / Debt / Liquid
+      • Channel -> Retail / DHNI / VRM / Insti / Digital / ...
+    """
+    if frame is None or frame.empty or metric_column not in frame.columns:
+        st.info("No metrics are available for this view.")
+        return
+
+    work = frame.copy()
+
+    overall = work.loc[work[metric_column] == "Overall"].copy()
+    assets = work.loc[work[metric_column].isin(FINAL_ASSET_ROWS)].copy()
+    channels = work.loc[
+        ~work[metric_column].isin(["Overall", *FINAL_ASSET_ROWS])
+    ].copy()
+
+    if not overall.empty:
+        st.markdown("<div class='subsection-title'>Overall</div>", unsafe_allow_html=True)
+        overall = overall.rename(columns={metric_column: "Scope"})
+        overall["Scope"] = "Overall"
+        overall_formats = dict(formats)
+        overall_formats.pop(metric_column, None)
+        overall_formats["Scope"] = "txt"
+        show_table(overall, overall_formats)
+
+    if not assets.empty:
+        st.markdown("<div class='subsection-title'>Asset Class</div>", unsafe_allow_html=True)
+        assets = assets.rename(columns={metric_column: "Asset Class"})
+        asset_formats = dict(formats)
+        asset_formats.pop(metric_column, None)
+        asset_formats["Asset Class"] = "txt"
+        show_table(assets, asset_formats)
+
+    if not channels.empty:
+        st.markdown("<div class='subsection-title'>Channel</div>", unsafe_allow_html=True)
+        channels = channels.rename(columns={metric_column: "Channel"})
+        channel_formats = dict(formats)
+        channel_formats.pop(metric_column, None)
+        channel_formats["Channel"] = "txt"
+        show_table(channels, channel_formats)
+
+
+def render_current_runrate_metric_grid(
+    final_metrics: Dict[str, Any],
+    model: "ScenarioModel",
+) -> None:
+    """Current FINAL run-rate grid, shown after current-vs-scenario comparison."""
+    section("Current Run-Rate Metric Grid")
+
+    display_cols = [
+        "FY27 Target",
+        "YTD",
+        "Achievement %",
+        "Current RR",
+        "Required RR to Target",
+        "Estimated FY @ Current RR",
+        "Projected FY %",
+    ]
+    formats = {
+        "Metric": "txt",
+        "FY27 Target": "cr",
+        "YTD": "cr",
+        "Achievement %": "pct",
+        "Current RR": "cr",
+        "Required RR to Target": "cr",
+        "Estimated FY @ Current RR": "cr",
+        "Projected FY %": "pct",
+    }
+
+    tabs = st.tabs(["Gross Sales", "Net Sales"])
+    for tab, sales in zip(tabs, SALES_TYPES):
+        with tab:
+            frame = final_sales_metrics(final_metrics, model, sales)
+            if frame.empty:
+                st.info(f"{SALES_LABEL[sales]} metrics could not be located in FINAL.")
+                continue
+
+            display = frame.reset_index()[["Metric", *display_cols]]
+            _render_metric_bifurcation(display, formats)
+
+
+def render_final_metric_baseline(
+    final_metrics: Dict[str, Any],
+    model: "ScenarioModel",
+) -> None:
+    """Headline management metrics sourced from FINAL."""
+    section("Current Performance Metrics · FINAL")
+
+    gs = final_sales_metrics(final_metrics, model, "GS")
+    ns = final_sales_metrics(final_metrics, model, "NS")
+
+    def overall(frame: pd.DataFrame) -> pd.Series:
+        return (
+            frame.loc["Overall"]
+            if not frame.empty and "Overall" in frame.index
+            else pd.Series(dtype=float)
+        )
+
+    gs_o = overall(gs)
+    ns_o = overall(ns)
+
+    kpi_row([
+        ("GS FY27 Target", fmt_cr(gs_o.get("FY27 Target")), "FINAL", "off"),
+        ("GS YTD", fmt_cr(gs_o.get("YTD")),
+         fmt_pct(gs_o.get("Achievement %"))
+         if _num(gs_o.get("Achievement %")) is not None else None),
+        ("GS Current RR", fmt_cr(gs_o.get("Current RR")), "Current pace", "off"),
+        ("GS Required RR", fmt_cr(gs_o.get("Required RR to Target")), "Target pace", "off"),
+        ("GS Projected FY %", fmt_pct(gs_o.get("Projected FY %")),
+         None if _num(gs_o.get("Projected FY %")) is None
+         else fmt_pts(gs_o.get("Projected FY %") - 1.0)),
+    ])
+
+    kpi_row([
+        ("NS FY27 Target", fmt_cr(ns_o.get("FY27 Target")), "FINAL", "off"),
+        ("NS YTD", fmt_cr(ns_o.get("YTD")),
+         fmt_pct(ns_o.get("Achievement %"))
+         if _num(ns_o.get("Achievement %")) is not None else None),
+        ("NS Current RR", fmt_cr(ns_o.get("Current RR")), "Current pace", "off"),
+        ("NS Required RR", fmt_cr(ns_o.get("Required RR to Target")), "Target pace", "off"),
+        ("NS Projected FY %", fmt_pct(ns_o.get("Projected FY %")),
+         None if _num(ns_o.get("Projected FY %")) is None
+         else fmt_pts(ns_o.get("Projected FY %") - 1.0)),
+    ])
+
+    st.markdown(
+        "<div class='note'>Headline performance is sourced from the workbook's "
+        "<b>FINAL</b> sheet. Current RR shows the observed YTD pace; Required RR "
+        "shows the monthly pace implied by the full-year target.</div>",
+        unsafe_allow_html=True,
     )
 
-    if selected_scenario == FORECAST_NAME:
-        gs_target = selected_result["GS Total FY Target"].sum()
-        gs_projected = selected_result["GS Total Projected FY Achievement"].sum()
-        ns_target = selected_result["NS Total FY Target"].sum()
-        ns_projected = selected_result["NS Total Projected FY Achievement"].sum()
-        gs_pct = gs_projected / gs_target if gs_target > 0 else 0.0
-        ns_pct = ns_projected / ns_target if ns_target > 0 else 0.0
 
-        summary_df = pd.DataFrame(
-            {
-                "Metric": [
-                    "Employees",
-                    "Selected Case",
-                    "Months Completed",
-                    "GS Projected FY Achievement %",
-                    "NS Projected FY Achievement %",
-                ],
-                "Value": [
-                    len(selected_result),
-                    selected_scenario,
-                    months_completed,
-                    gs_pct,
-                    ns_pct,
-                ],
+def render_final_scenario_comparison(
+    final_metrics: Dict[str, Any],
+    model: "ScenarioModel",
+    basis: str,
+) -> None:
+    """Selected scenario compared with the same FINAL metrics used in the baseline."""
+    section(f"Current Metrics vs Scenario {model.scenario_id} · {model.meta['name']}")
+
+    gs_frame, gs_formats = build_final_scenario_comparison(final_metrics, model, "GS")
+    ns_frame, ns_formats = build_final_scenario_comparison(final_metrics, model, "NS")
+
+    def overall_row(frame: pd.DataFrame) -> pd.Series:
+        if frame.empty:
+            return pd.Series(dtype=float)
+        match = frame.loc[frame["Metric"] == "Overall"]
+        return match.iloc[0] if not match.empty else pd.Series(dtype=float)
+
+    gs_o = overall_row(gs_frame)
+    ns_o = overall_row(ns_frame)
+
+    kpi_row([
+        ("GS Current Projection", fmt_pct(gs_o.get("Current Projected %")),
+         fmt_cr(gs_o.get("Current FY Estimate")), "off"),
+        ("GS Scenario Projection", fmt_pct(gs_o.get("Scenario March %")),
+         None if _num(gs_o.get("Scenario Δ pp")) is None
+         else fmt_pts(gs_o.get("Scenario Δ pp"))),
+        ("GS Current RR", fmt_cr(gs_o.get("Current RR")), "Current pace", "off"),
+        ("GS Scenario RR", fmt_cr(gs_o.get("Scenario / Required RR")),
+         fmt_pct_signed(gs_o.get("Run Rate Change %"))
+         if _num(gs_o.get("Run Rate Change %")) is not None else None),
+    ])
+
+    kpi_row([
+        ("NS Current Projection", fmt_pct(ns_o.get("Current Projected %")),
+         fmt_cr(ns_o.get("Current FY Estimate")), "off"),
+        ("NS Scenario Projection", fmt_pct(ns_o.get("Scenario March %")),
+         None if _num(ns_o.get("Scenario Δ pp")) is None
+         else fmt_pts(ns_o.get("Scenario Δ pp"))),
+        ("NS Current RR", fmt_cr(ns_o.get("Current RR")), "Current pace", "off"),
+        ("NS Scenario RR", fmt_cr(ns_o.get("Scenario / Required RR")),
+         fmt_pct_signed(ns_o.get("Run Rate Change %"))
+         if _num(ns_o.get("Run Rate Change %")) is not None else None),
+    ])
+
+    st.markdown(
+        f"<div class='scenario-highlight'><b>Scenario {model.scenario_id} · "
+        f"{model.meta['name']}</b><br>{model.meta['explanation']}</div>",
+        unsafe_allow_html=True,
+    )
+
+    tabs = st.tabs(["Gross Sales · Current vs Scenario", "Net Sales · Current vs Scenario"])
+    with tabs[0]:
+        _render_metric_bifurcation(gs_frame, gs_formats)
+    with tabs[1]:
+        _render_metric_bifurcation(ns_frame, ns_formats)
+
+    st.markdown(
+        "<div class='note'>Overall and Asset Class are shown separately from Channel. "
+        "Retail, DHNI and VRM have scenario calculations from their detailed sheets. "
+        "Channels such as Insti/Digital remain visible as current FINAL metrics; "
+        "scenario fields stay blank where no detailed calculation sheet exists.</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_final_dashboard(payload: bytes) -> None:
+    """Display the workbook's sixth FINAL sheet inside the Streamlit app."""
+    st.markdown(
+        "<div class='app-title'>Sales Target Achievement Dashboard</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        "<div class='app-sub'>Directly read from the workbook's FINAL sheet — "
+        "GS / NS achievement, AUM, run-rate estimates and vertical breakouts.</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("<div class='app-rule'></div>", unsafe_allow_html=True)
+
+    try:
+        html = build_final_sheet_html(payload)
+    except WorkbookError as error:
+        st.error(str(error))
+        return
+
+    st.markdown(
+        "<div class='note'>This view is taken from the Excel <b>FINAL</b> sheet. "
+        "Use the horizontal scroll inside the dashboard to see all columns.</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+    with st.expander("View FINAL sheet as raw data", expanded=False):
+        try:
+            raw = load_final_sheet_frame(payload)
+            st.dataframe(raw, use_container_width=True, hide_index=True, height=620)
+        except WorkbookError as error:
+            st.error(str(error))
+
+    st.download_button(
+        "Download uploaded workbook",
+        data=payload,
+        file_name="sales_target_dashboard_source.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=False,
+    )
+
+
+# =============================================================================
+# 4. SEGMENT IDENTIFICATION (Scenario 6)
+# =============================================================================
+
+def identify_segments(records: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+    """Suggest a column + values that identify each configured business segment."""
+    suggestions: Dict[str, Dict[str, Any]] = {}
+    for segment, rule in SEGMENT_RULES.items():
+        for column in rule["search_columns"]:
+            if column not in records.columns:
+                continue
+            values = sorted({v for v in text_column(records, column) if v.strip()})
+            matches = [
+                v for v in values
+                if any(keyword in v.casefold() for keyword in rule["keywords"])
+            ]
+            if matches:
+                suggestions[segment] = {"column": column, "values": matches}
+                break
+    return suggestions
+
+
+def map_business_segments(
+    records: pd.DataFrame,
+    mapping: Dict[str, Dict[str, Any]],
+) -> pd.DataFrame:
+    """Assign every record to Digital / Retail B30 / Others using the mapping."""
+    out = records.copy()
+    out["Segment"] = FALLBACK_SEGMENT
+    # Reverse priority so that the first segment in SEGMENT_ORDER wins.
+    for segment in reversed([s for s in SEGMENT_ORDER if s != FALLBACK_SEGMENT]):
+        rule = mapping.get(segment)
+        if not rule:
+            continue
+        column, values = rule.get("column"), set(rule.get("values") or [])
+        if not column or column not in out.columns or not values:
+            continue
+        mask = text_column(out, column).isin(values)
+        out.loc[mask, "Segment"] = segment
+    return out
+
+
+def segment_diagnostics(records: pd.DataFrame) -> Dict[str, int]:
+    counts = records["Segment"].value_counts().to_dict()
+    return {segment: int(counts.get(segment, 0)) for segment in SEGMENT_ORDER}
+
+
+# =============================================================================
+# 5. BASE GRID & CURRENT-STATE STATISTICS
+# =============================================================================
+
+def build_base_grid(records: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate records to the finest analytical grain used by the engine."""
+    rows: List[Dict[str, Any]] = []
+    grouped = records.groupby(["Vertical", "Segment"], dropna=False)
+    for (vertical, segment), block in grouped:
+        for sales in SALES_TYPES:
+            for asset in ASSETS:
+                rows.append({
+                    "Vertical": vertical,
+                    "Segment": segment,
+                    "Sales": sales,
+                    "Asset": asset,
+                    "fy_target": float(block[f"{sales}_{asset}_fy"].sum()),
+                    "ytd_target": float(block[f"{sales}_{asset}_ytd_tgt"].sum()),
+                    "ytd_ach": float(block[f"{sales}_{asset}_ach"].sum()),
+                })
+    return pd.DataFrame(rows)
+
+
+def filter_grid(
+    grid: pd.DataFrame,
+    sales: Optional[str] = None,
+    asset: Optional[str] = None,
+    vertical: Optional[str] = None,
+    segment: Optional[str] = None,
+) -> pd.DataFrame:
+    mask = pd.Series(True, index=grid.index)
+    if sales is not None:
+        mask &= grid["Sales"] == sales
+    if asset is not None:
+        mask &= grid["Asset"] == asset
+    if vertical is not None:
+        mask &= grid["Vertical"] == vertical
+    if segment is not None:
+        mask &= grid["Segment"] == segment
+    return grid.loc[mask]
+
+
+def current_asset_stats(fy_target: float, ytd_target: float, ytd_ach: float) -> Dict[str, Any]:
+    """Baseline statistics for one asset / group. Never scenario dependent."""
+    fy_target = _z(fy_target)
+    ytd_target = _z(ytd_target)
+    ytd_ach = _z(ytd_ach)
+    current_rr = ytd_ach / MONTHS_COMPLETED if MONTHS_COMPLETED else None
+    current_march = ytd_ach + (current_rr or 0.0) * MONTHS_REMAINING
+    return {
+        "fy_target": fy_target,
+        "ytd_target": ytd_target,
+        "ytd_ach": ytd_ach,
+        "current_rr": current_rr,
+        "ytd_ach_pct": safe_div(ytd_ach, ytd_target),
+        "fy_completed_pct": safe_div(ytd_ach, fy_target),
+        "current_march": current_march,
+        "current_march_pct": safe_div(current_march, fy_target),
+    }
+
+
+def summarize_current(grid: pd.DataFrame, **filters: Any) -> Dict[str, Any]:
+    """Baseline statistics for an arbitrary slice of the base grid."""
+    subset = filter_grid(grid, **filters)
+    return current_asset_stats(
+        subset["fy_target"].sum(),
+        subset["ytd_target"].sum(),
+        subset["ytd_ach"].sum(),
+    )
+
+
+# =============================================================================
+# 6. SCENARIO ENGINE - SCENARIOS 1 TO 6
+# =============================================================================
+
+def _blank_cell(stats: Dict[str, Any]) -> Dict[str, Any]:
+    cell = dict(stats)
+    cell.update({
+        "scen_rr": None, "rr_change_pct": None, "feb_mar_rr": None,
+        "jan_required": None, "jan_amount": None, "jan_pct": None,
+        "jan_buffer": None, "jan_buffer_pct": None,
+        "march_required": None, "march_amount": None, "march_pct": None,
+        "milestone_pct": None, "incremental_sales": None,
+        "headroom_amt": None, "headroom_pct": None,
+        "momentum_g": None, "feasible": None, "binding": None,
+        "trajectory": None, "note": "",
+    })
+    return cell
+
+
+def compute_cell(
+    fy_target: float,
+    ytd_target: float,
+    ytd_ach: float,
+    kind: str,
+    multiplier: Optional[float] = None,
+    uplift: Optional[float] = None,
+    dip: float = 0.0,
+) -> Dict[str, Any]:
+    """Scenario mathematics for one asset / group (scenarios 1-6)."""
+    stats = current_asset_stats(fy_target, ytd_target, ytd_ach)
+    cell = _blank_cell(stats)
+    ach = stats["ytd_ach"]
+    current_rr = stats["current_rr"] or 0.0
+
+    if kind == "runrate":
+        scen_rr = current_rr * (1.0 + (uplift or 0.0))
+        jan_amount = ach + scen_rr * MONTHS_JUL_JAN
+        cell.update({
+            "scen_rr": scen_rr,
+            "feb_mar_rr": scen_rr,
+            "jan_amount": jan_amount,
+            "march_amount": ach + scen_rr * MONTHS_REMAINING,
+            "milestone_pct": None,
+        })
+
+    elif kind == "jan_target":
+        required = max(_z(multiplier) * stats["fy_target"], ach)
+        scen_rr = max(required - ach, 0.0) / MONTHS_JUL_JAN
+        jan_amount = ach + scen_rr * MONTHS_JUL_JAN
+        feb_mar_rr = scen_rr * (1.0 - dip)
+        cell.update({
+            "scen_rr": scen_rr,
+            "feb_mar_rr": feb_mar_rr,
+            "jan_required": required,
+            "jan_amount": jan_amount,
+            "march_amount": jan_amount + feb_mar_rr * MONTHS_FEB_MAR,
+            "milestone_pct": multiplier,
+        })
+
+    elif kind == "march_target":
+        required = max(_z(multiplier) * stats["fy_target"], ach)
+        scen_rr = max(required - ach, 0.0) / MONTHS_REMAINING
+        cell.update({
+            "scen_rr": scen_rr,
+            "feb_mar_rr": scen_rr,
+            "march_required": required,
+            "jan_amount": ach + scen_rr * MONTHS_JUL_JAN,
+            "march_amount": ach + scen_rr * MONTHS_REMAINING,
+            "milestone_pct": multiplier,
+        })
+
+    else:  # pragma: no cover - guarded by the scenario registry
+        raise ValueError(f"Unknown scenario kind: {kind}")
+
+    return _finalise_cell(cell)
+
+
+def _finalise_cell(cell: Dict[str, Any]) -> Dict[str, Any]:
+    """Recompute all derived ratios from the absolute amounts in the cell."""
+    fy_target = cell.get("fy_target")
+    current_rr = _num(cell.get("current_rr"))
+    scen_rr = _num(cell.get("scen_rr"))
+
+    cell["ytd_ach_pct"] = safe_div(cell.get("ytd_ach"), cell.get("ytd_target"))
+    cell["fy_completed_pct"] = safe_div(cell.get("ytd_ach"), fy_target)
+    cell["current_march_pct"] = safe_div(cell.get("current_march"), fy_target)
+    cell["jan_pct"] = safe_div(cell.get("jan_amount"), fy_target)
+    cell["march_pct"] = safe_div(cell.get("march_amount"), fy_target)
+
+    if current_rr is not None and current_rr > 0 and scen_rr is not None:
+        cell["rr_change_pct"] = (scen_rr / current_rr) - 1.0
+    else:
+        cell["rr_change_pct"] = None
+
+    march_amount = _num(cell.get("march_amount"))
+    current_march = _num(cell.get("current_march"))
+    if march_amount is not None and current_march is not None:
+        cell["incremental_sales"] = march_amount - current_march
+
+    jan_required = _num(cell.get("jan_required"))
+    jan_amount = _num(cell.get("jan_amount"))
+    if jan_required is not None and jan_amount is not None:
+        cell["jan_buffer"] = jan_amount - jan_required
+        cell["jan_buffer_pct"] = safe_div(cell["jan_buffer"], jan_required)
+
+    march_required = _num(cell.get("march_required"))
+    if march_required is not None and march_amount is not None:
+        cell["headroom_amt"] = march_amount - march_required
+        march_pct = cell.get("march_pct")
+        required_pct = safe_div(march_required, fy_target)
+        if march_pct is not None and required_pct is not None:
+            cell["headroom_pct"] = march_pct - required_pct
+        cell["feasible"] = cell["headroom_amt"] >= -1e-6
+
+    if cell.get("milestone_pct") is None:
+        cell["milestone_pct"] = cell.get("march_pct")
+    return cell
+
+
+def scenario_multipliers(grid: pd.DataFrame, scenario_id: int) -> Dict[Tuple[str, str, str], float]:
+    """
+    Derive the per-asset FY-target multiplier for the selected scenario.
+
+    Key is (sales type, asset, segment); segment is '*' unless the scenario
+    differentiates by business segment.
+    """
+    multipliers: Dict[Tuple[str, str, str], float] = {}
+
+    if scenario_id in (1, 7):
+        return multipliers
+
+    if scenario_id == 3:
+        for sales in SALES_TYPES:
+            for asset in ASSETS:
+                multipliers[(sales, asset, "*")] = S3_TARGET
+        return multipliers
+
+    if scenario_id == 4:
+        for sales in SALES_TYPES:
+            for asset in ASSETS:
+                multipliers[(sales, asset, "*")] = S4_TARGET
+        return multipliers
+
+    if scenario_id == 6:
+        for sales in SALES_TYPES:
+            for asset in ASSETS:
+                for segment in SEGMENT_ORDER:
+                    multipliers[(sales, asset, segment)] = S6_SEGMENT_TARGETS.get(segment, 1.0)
+        return multipliers
+
+    # Scenarios 2 and 5 balance Debt and Liquid around a fixed Equity ambition.
+    equity_mult = S2_EQUITY_TARGET if scenario_id == 2 else S5_EQUITY_TARGET
+    overall_mult = S2_OVERALL_TARGET if scenario_id == 2 else S5_OVERALL_TARGET
+
+    for sales in SALES_TYPES:
+        targets = {
+            asset: float(filter_grid(grid, sales=sales, asset=asset)["fy_target"].sum())
+            for asset in ASSETS
+        }
+        total_target = sum(targets.values())
+        required_overall = overall_mult * total_target
+        required_equity = equity_mult * targets["Equity"]
+        remaining = max(required_overall - required_equity, 0.0)
+        denominator = targets["Debt"] + targets["Liquid"]
+        share = safe_div(remaining, denominator)
+        balance_mult = 0.0 if share is None else share
+        multipliers[(sales, "Equity", "*")] = equity_mult
+        multipliers[(sales, "Debt", "*")] = balance_mult
+        multipliers[(sales, "Liquid", "*")] = balance_mult
+
+    return multipliers
+
+
+def _multiplier_for(
+    multipliers: Dict[Tuple[str, str, str], float],
+    sales: str,
+    asset: str,
+    segment: str,
+) -> Optional[float]:
+    if (sales, asset, segment) in multipliers:
+        return multipliers[(sales, asset, segment)]
+    return multipliers.get((sales, asset, "*"))
+
+
+def apply_scenario_grid(
+    grid: pd.DataFrame,
+    scenario_id: int,
+    params: Dict[str, Any],
+    multipliers: Dict[Tuple[str, str, str], float],
+) -> pd.DataFrame:
+    """Evaluate scenarios 1-6 over every cell of the base grid."""
+    kind = SCENARIOS[scenario_id]["kind"]
+    dip = float(params.get("dip", 0.0)) if scenario_id == 3 else 0.0
+    uplift = S1_RUNRATE_UPLIFT if scenario_id == 1 else None
+
+    results: List[Dict[str, Any]] = []
+    for row in grid.to_dict("records"):
+        multiplier = _multiplier_for(multipliers, row["Sales"], row["Asset"], row["Segment"])
+        cell = compute_cell(
+            row["fy_target"], row["ytd_target"], row["ytd_ach"],
+            kind=kind, multiplier=multiplier, uplift=uplift, dip=dip,
+        )
+        cell.update({
+            "Vertical": row["Vertical"], "Segment": row["Segment"],
+            "Sales": row["Sales"], "Asset": row["Asset"],
+        })
+        results.append(cell)
+    return pd.DataFrame(results)
+
+
+SUMMABLE_FIELDS = [
+    "fy_target", "ytd_target", "ytd_ach", "current_rr", "current_march",
+    "scen_rr", "feb_mar_rr", "jan_required", "jan_amount",
+    "march_required", "march_amount",
+]
+
+
+def summarize_cells(subset: pd.DataFrame) -> Dict[str, Any]:
+    """Aggregate scenario cells additively and rebuild every derived ratio."""
+    cell: Dict[str, Any] = {}
+    for field in SUMMABLE_FIELDS:
+        cell[field] = _ssum(subset[field]) if field in subset.columns else None
+    milestones = subset["milestone_pct"].dropna().unique() if "milestone_pct" in subset else []
+    cell["milestone_pct"] = float(milestones[0]) if len(milestones) == 1 else None
+    cell["note"] = ""
+    cell["momentum_g"] = None
+    cell["trajectory"] = None
+    cell["binding"] = None
+    cell["feasible"] = None
+    return _finalise_cell(cell)
+
+
+# --- Named scenario entry points (thin wrappers over the shared engine) -------
+
+def _scenario_frame(grid: pd.DataFrame, scenario_id: int, params: Dict[str, Any]) -> pd.DataFrame:
+    return apply_scenario_grid(grid, scenario_id, params, scenario_multipliers(grid, scenario_id))
+
+
+def calculate_scenario_1(grid: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
+    """+20% run-rate push from July onward."""
+    return _scenario_frame(grid, 1, params)
+
+
+def calculate_scenario_2(grid: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
+    """100% Equity and 75% overall FY target by January."""
+    return _scenario_frame(grid, 2, params)
+
+
+def calculate_scenario_3(grid: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
+    """100% of FY target by January, then a configurable Feb-Mar dip."""
+    return _scenario_frame(grid, 3, params)
+
+
+def calculate_scenario_4(grid: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
+    """120% of FY target by March."""
+    return _scenario_frame(grid, 4, params)
+
+
+def calculate_scenario_5(grid: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
+    """120% Equity and 100% overall FY target by March."""
+    return _scenario_frame(grid, 5, params)
+
+
+def calculate_scenario_6(grid: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
+    """Digital 140%, Retail B30 125%, Others 115% of their FY targets."""
+    return _scenario_frame(grid, 6, params)
+
+
+SCENARIO_FUNCTIONS = {
+    1: calculate_scenario_1,
+    2: calculate_scenario_2,
+    3: calculate_scenario_3,
+    4: calculate_scenario_4,
+    5: calculate_scenario_5,
+    6: calculate_scenario_6,
+}
+
+
+# =============================================================================
+# 7. SCENARIO 7 - MOMENTUM ENGINE
+# =============================================================================
+
+def _momentum_sum(growth: float, months: int, tail_factors: Sequence[float]) -> float:
+    """Sum of compounding monthly run-rate multiples, including leakage tail."""
+    factor = 1.0 + growth
+    build = sum(factor ** k for k in range(1, months + 1))
+    tail = sum(f * factor ** months for f in tail_factors)
+    return build + tail
+
+
+def solve_momentum_rate(
+    current_rr: float,
+    required_amount: float,
+    months: int = MONTHS_JUL_JAN,
+    tail_factors: Sequence[float] = (),
+    upper: float = 3.0,
+) -> Optional[float]:
+    """
+    Back-solve the minimum month-on-month growth rate g such that the
+    compounding trajectory delivers the required incremental amount.
+
+    Returns 0.0 when no additional momentum is needed and None when the
+    requirement cannot be met within the search bounds.
+    """
+    rr = _num(current_rr)
+    need = _num(required_amount)
+    if rr is None or need is None or rr <= 0:
+        return None
+    if need <= 0:
+        return 0.0
+
+    def shortfall(growth: float) -> float:
+        return rr * _momentum_sum(growth, months, tail_factors) - need
+
+    if shortfall(0.0) >= 0:
+        return 0.0
+    if shortfall(upper) < 0:
+        return None
+
+    low, high = 0.0, upper
+    for _ in range(240):
+        mid = (low + high) / 2.0
+        if shortfall(mid) >= 0:
+            high = mid
+        else:
+            low = mid
+    return high
+
+
+def calculate_momentum_trajectory(
+    current_rr: float,
+    growth: Optional[float],
+    leakage: float,
+    flat_rate: Optional[float] = None,
+) -> List[float]:
+    """Monthly run rates for July → March (momentum build, then leakage)."""
+    if growth is None:
+        base = _z(flat_rate)
+        build = [base] * MONTHS_JUL_JAN
+    else:
+        rr = _z(current_rr)
+        build = [rr * (1.0 + growth) ** k for k in range(1, MONTHS_JUL_JAN + 1)]
+    january_rr = build[-1] if build else 0.0
+    february_rr = january_rr * (1.0 - leakage)
+    march_rr = february_rr * (1.0 - leakage)
+    return build + [february_rr, march_rr]
+
+
+def calculate_leakage_impact(january_rr: float, leakage: float) -> Dict[str, float]:
+    """February and March run rates after AUM leakage / run-rate pressure."""
+    february_rr = _z(january_rr) * (1.0 - leakage)
+    march_rr = february_rr * (1.0 - leakage)
+    return {
+        "february_rr": february_rr,
+        "march_rr": march_rr,
+        "feb_mar_sales": february_rr + march_rr,
+    }
+
+
+def calculate_momentum_headroom(
+    march_amount: float,
+    march_required: float,
+    fy_target: float,
+    march_target_pct: float,
+) -> Dict[str, Optional[float]]:
+    """Scenario achievement versus the March ambition, in ₹ and in points."""
+    headroom_amt = _z(march_amount) - _z(march_required)
+    achieved_pct = safe_div(march_amount, fy_target)
+    headroom_pct = None if achieved_pct is None else achieved_pct - march_target_pct
+    return {"headroom_amt": headroom_amt, "headroom_pct": headroom_pct}
+
+
+def calculate_scenario_7(
+    fy_target: float,
+    ytd_target: float,
+    ytd_ach: float,
+    params: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Momentum build-up model.
+
+    Solves for the month-on-month growth rate that simultaneously satisfies the
+    January milestone and, after Feb-Mar leakage, the March ambition.
+    """
+    jan_target_pct = float(params.get("jan_target", S7_DEFAULT_JAN_TARGET))
+    mar_target_pct = float(params.get("mar_target", S7_DEFAULT_MAR_TARGET))
+    leakage = float(params.get("leakage", S7_DEFAULT_LEAKAGE))
+
+    stats = current_asset_stats(fy_target, ytd_target, ytd_ach)
+    cell = _blank_cell(stats)
+    ach = stats["ytd_ach"]
+    current_rr = stats["current_rr"] or 0.0
+
+    jan_required = max(jan_target_pct * stats["fy_target"], ach)
+    mar_required = max(mar_target_pct * stats["fy_target"], ach)
+    tail = ((1.0 - leakage), (1.0 - leakage) ** 2)
+
+    growth_jan = solve_momentum_rate(current_rr, jan_required - ach, MONTHS_JUL_JAN)
+    growth_mar = solve_momentum_rate(current_rr, mar_required - ach, MONTHS_JUL_JAN, tail)
+
+    note = ""
+    binding = None
+    flat_rate = None
+
+    if current_rr <= 0:
+        # Momentum compounding is undefined on a non-positive run rate:
+        # fall back to the flat run rate required to hold both milestones.
+        flat_jan = max(jan_required - ach, 0.0) / MONTHS_JUL_JAN
+        denominator = MONTHS_JUL_JAN + tail[0] + tail[1]
+        flat_mar = max(mar_required - ach, 0.0) / denominator
+        flat_rate = max(flat_jan, flat_mar)
+        growth = None
+        binding = "January" if flat_jan >= flat_mar else "March"
+        note = (
+            "Current run rate is not positive, so compounding momentum cannot be applied. "
+            "The flat monthly run rate required to hold the milestones is shown instead."
+        )
+    elif growth_jan is None and growth_mar is None:
+        growth = None
+        flat_rate = max(mar_required - ach, 0.0) / (MONTHS_JUL_JAN + tail[0] + tail[1])
+        binding = "March"
+        note = "The requirement exceeds the momentum search range; a flat required run rate is shown."
+    else:
+        candidates = [g for g in (growth_jan, growth_mar) if g is not None]
+        growth = max(candidates)
+        binding = "March" if (growth_mar is not None and growth == growth_mar
+                              and (growth_jan is None or growth_mar >= growth_jan)) else "January"
+
+    trajectory = calculate_momentum_trajectory(current_rr, growth, leakage, flat_rate)
+    build_phase = trajectory[:MONTHS_JUL_JAN]
+    jan_amount = ach + sum(build_phase)
+    january_rr = build_phase[-1] if build_phase else 0.0
+    leak = calculate_leakage_impact(january_rr, leakage)
+    march_amount = jan_amount + leak["feb_mar_sales"]
+
+    headroom = calculate_momentum_headroom(
+        march_amount, mar_required, stats["fy_target"], mar_target_pct
+    )
+    shortfall = max(mar_required - march_amount, 0.0)
+    denominator = 1.0 + tail[0] + tail[1]
+    additional_jan_rr = shortfall / denominator if denominator else None
+
+    cell.update({
+        "scen_rr": january_rr,
+        "feb_mar_rr": leak["february_rr"],
+        "march_rr": leak["march_rr"],
+        "jan_required": jan_required,
+        "jan_amount": jan_amount,
+        "march_required": mar_required,
+        "march_amount": march_amount,
+        "milestone_pct": jan_target_pct,
+        "march_target_pct": mar_target_pct,
+        "momentum_g": growth,
+        "flat_rate": flat_rate,
+        "leakage": leakage,
+        "trajectory": trajectory,
+        "binding": binding,
+        "note": note,
+        "additional_march_sales": shortfall,
+        "additional_jan_rr": additional_jan_rr,
+        "avg_scen_rr": (sum(trajectory) / len(trajectory)) if trajectory else None,
+    })
+    cell = _finalise_cell(cell)
+    cell["headroom_amt"] = headroom["headroom_amt"]
+    cell["headroom_pct"] = headroom["headroom_pct"]
+    cell["feasible"] = shortfall <= 1e-6
+    # Momentum run rate versus the current flat run rate, measured on the
+    # January exit rate (the pace the business must be running at by then).
+    cell["rr_change_pct"] = (
+        (january_rr / current_rr) - 1.0 if current_rr and current_rr > 0 else None
+    )
+    return cell
+
+
+# =============================================================================
+# 8. SCENARIO MODEL - ONE INTERFACE FOR EVERY VIEW
+# =============================================================================
+
+class ScenarioModel:
+    """Evaluates the selected scenario for any slice of the business."""
+
+    def __init__(self, scenario_id: int, grid: pd.DataFrame, params: Dict[str, Any]):
+        self.scenario_id = scenario_id
+        self.meta = SCENARIOS[scenario_id]
+        self.grid = grid
+        self.params = params
+        self.multipliers = scenario_multipliers(grid, scenario_id)
+        self._cache: Dict[Tuple, Dict[str, Any]] = {}
+        if scenario_id == 7:
+            self.scenario_grid = None
+        else:
+            self.scenario_grid = SCENARIO_FUNCTIONS[scenario_id](grid, params)
+
+    # -- core accessor --------------------------------------------------------
+    def cell(
+        self,
+        sales: str,
+        asset: Optional[str] = None,
+        vertical: Optional[str] = None,
+        segment: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        key = (sales, asset, vertical, segment)
+        if key in self._cache:
+            return self._cache[key]
+
+        if self.scenario_id == 7:
+            subset = filter_grid(self.grid, sales=sales, asset=asset,
+                                 vertical=vertical, segment=segment)
+            cell = calculate_scenario_7(
+                subset["fy_target"].sum(),
+                subset["ytd_target"].sum(),
+                subset["ytd_ach"].sum(),
+                self.params,
+            )
+        else:
+            frame = self.scenario_grid
+            mask = frame["Sales"] == sales
+            if asset is not None:
+                mask &= frame["Asset"] == asset
+            if vertical is not None:
+                mask &= frame["Vertical"] == vertical
+            if segment is not None:
+                mask &= frame["Segment"] == segment
+            cell = summarize_cells(frame.loc[mask])
+
+        self._cache[key] = cell
+        return cell
+
+    # -- convenience views ----------------------------------------------------
+    def assets(self, sales: str, **filters: Any) -> Dict[str, Dict[str, Any]]:
+        return {asset: self.cell(sales, asset=asset, **filters) for asset in ASSETS}
+
+    def baseline(self, sales: str, **filters: Any) -> Dict[str, Any]:
+        return summarize_current(self.grid, sales=sales, **filters)
+
+    def implied_milestones(self, sales: str) -> Dict[str, Optional[float]]:
+        return {
+            asset: _multiplier_for(self.multipliers, sales, asset, "*")
+            for asset in ASSETS
+        }
+
+    def available_segments(self) -> List[str]:
+        present = set(self.grid["Segment"].unique())
+        return [s for s in SEGMENT_ORDER if s in present]
+
+    def available_verticals(self) -> List[str]:
+        present = set(self.grid["Vertical"].unique())
+        return [v for v in VERTICALS if v in present]
+
+
+# =============================================================================
+# 9. REVENUE ENGINE
+# =============================================================================
+
+def calculate_revenue(cells_by_asset: Dict[str, Dict[str, Any]], field: str) -> Dict[str, Any]:
+    """Asset-class revenue from a set of scenario cells. No blended rate."""
+    by_asset: Dict[str, Optional[float]] = {}
+    sales_by_asset: Dict[str, Optional[float]] = {}
+    total = 0.0
+    for asset in ASSETS:
+        amount = _num(cells_by_asset.get(asset, {}).get(field))
+        sales_by_asset[asset] = amount
+        revenue = None if amount is None else amount * REVENUE_RATE[asset]
+        by_asset[asset] = revenue
+        total += 0.0 if revenue is None else revenue
+    return {"by_asset": by_asset, "sales_by_asset": sales_by_asset, "total": total}
+
+
+def calculate_baseline_revenue(cells_by_asset: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """Baseline revenue on the current-run-rate March projection (scenario independent)."""
+    return calculate_revenue(cells_by_asset, "current_march")
+
+
+def calculate_incremental_revenue(
+    scenario_revenue: Dict[str, Any],
+    baseline_revenue: Dict[str, Any],
+) -> Dict[str, Any]:
+    incremental = {
+        asset: (
+            None
+            if scenario_revenue["by_asset"].get(asset) is None
+            or baseline_revenue["by_asset"].get(asset) is None
+            else scenario_revenue["by_asset"][asset] - baseline_revenue["by_asset"][asset]
+        )
+        for asset in ASSETS
+    }
+    total = scenario_revenue["total"] - baseline_revenue["total"]
+    uplift = safe_div(scenario_revenue["total"], baseline_revenue["total"])
+    return {
+        "by_asset": incremental,
+        "total": total,
+        "uplift_pct": None if uplift is None else uplift - 1.0,
+        "contribution": {
+            asset: safe_div(scenario_revenue["by_asset"].get(asset), scenario_revenue["total"])
+            for asset in ASSETS
+        },
+    }
+
+
+def revenue_bundle(model: ScenarioModel, basis: str, **filters: Any) -> Dict[str, Any]:
+    """Baseline / scenario / incremental revenue for any slice of the business."""
+    cells = model.assets(basis, **filters)
+    baseline = calculate_baseline_revenue(cells)
+    scenario = calculate_revenue(cells, "march_amount")
+    january = calculate_revenue(cells, "jan_amount")
+    incremental = calculate_incremental_revenue(scenario, baseline)
+    return {
+        "cells": cells,
+        "baseline": baseline,
+        "scenario": scenario,
+        "january": january,
+        "incremental": incremental,
+    }
+
+
+# =============================================================================
+# 10. TABLE BUILDERS
+# =============================================================================
+
+def build_current_overview(model: ScenarioModel) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """Baseline table - identical for every scenario."""
+    rows = []
+    for sales in SALES_TYPES:
+        base = model.baseline(sales)
+        rows.append({
+            "Sales": SALES_LABEL[sales],
+            "FY Target": base["fy_target"],
+            "YTD June Target": base["ytd_target"],
+            "YTD June Achievement": base["ytd_ach"],
+            "Target Achieved %": base["ytd_ach_pct"],
+            "FY Target Completed %": base["fy_completed_pct"],
+            "Current Run Rate": base["current_rr"],
+            "Current March Projection": base["current_march"],
+            "Current March Projection %": base["current_march_pct"],
+        })
+    formats = {
+        "Sales": "txt", "FY Target": "cr", "YTD June Target": "cr",
+        "YTD June Achievement": "cr", "Target Achieved %": "pct",
+        "FY Target Completed %": "pct", "Current Run Rate": "cr",
+        "Current March Projection": "cr", "Current March Projection %": "pct",
+    }
+    return pd.DataFrame(rows), formats
+
+
+def summarize_scenario(model: ScenarioModel, sales: str) -> Dict[str, Any]:
+    """Headline current-versus-scenario numbers for one sales basis."""
+    cell = model.cell(sales)
+    return {
+        "Sales": SALES_LABEL[sales],
+        "Current Run Rate": cell["current_rr"],
+        "Scenario Run Rate": cell["scen_rr"],
+        "Run Rate Change %": cell["rr_change_pct"],
+        "Jan Achievement": cell["jan_amount"],
+        "Jan Achievement %": cell["jan_pct"],
+        "Feb-Mar Run Rate": cell["feb_mar_rr"],
+        "Current March Projection %": cell["current_march_pct"],
+        "Scenario March Achievement": cell["march_amount"],
+        "Scenario March Achievement %": cell["march_pct"],
+        "Incremental Sales": cell["incremental_sales"],
+    }
+
+
+def build_comparison(model: ScenarioModel) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """Current versus selected scenario, for Gross Sales and Net Sales."""
+    rows = [summarize_scenario(model, sales) for sales in SALES_TYPES]
+    formats = {
+        "Sales": "txt", "Current Run Rate": "cr", "Scenario Run Rate": "cr",
+        "Run Rate Change %": "pct_signed", "Jan Achievement": "cr",
+        "Jan Achievement %": "pct", "Feb-Mar Run Rate": "cr",
+        "Current March Projection %": "pct", "Scenario March Achievement": "cr",
+        "Scenario March Achievement %": "pct", "Incremental Sales": "cr_signed",
+    }
+    return pd.DataFrame(rows), formats
+
+
+def build_revenue_impact(model: ScenarioModel, basis: str) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """Revenue by asset class - never a blended rate."""
+    bundle = revenue_bundle(model, basis)
+    rows = []
+    for asset in ASSETS:
+        rows.append({
+            "Asset Class": asset,
+            "Scenario Sales": bundle["scenario"]["sales_by_asset"][asset],
+            "Revenue Rate": f"{REVENUE_BPS[asset]:.0f} bps",
+            "Scenario Revenue": bundle["scenario"]["by_asset"][asset],
+            "Baseline Revenue": bundle["baseline"]["by_asset"][asset],
+            "Incremental Revenue": bundle["incremental"]["by_asset"][asset],
+            "Revenue Contribution %": bundle["incremental"]["contribution"][asset],
+        })
+    rows.append({
+        "Asset Class": "Total",
+        "Scenario Sales": sum(_z(v) for v in bundle["scenario"]["sales_by_asset"].values()),
+        "Revenue Rate": "—",
+        "Scenario Revenue": bundle["scenario"]["total"],
+        "Baseline Revenue": bundle["baseline"]["total"],
+        "Incremental Revenue": bundle["incremental"]["total"],
+        "Revenue Contribution %": 1.0 if bundle["scenario"]["total"] else None,
+    })
+    formats = {
+        "Asset Class": "txt", "Scenario Sales": "cr", "Revenue Rate": "txt",
+        "Scenario Revenue": "cr1", "Baseline Revenue": "cr1",
+        "Incremental Revenue": "cr1_signed", "Revenue Contribution %": "pct",
+    }
+    return pd.DataFrame(rows), formats
+
+
+def build_vertical_summary(model: ScenarioModel) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """Retail, DHNI and VRM, for Gross Sales and Net Sales."""
+    rows = []
+    for vertical in model.available_verticals():
+        for sales in SALES_TYPES:
+            cell = model.cell(sales, vertical=vertical)
+            bundle = revenue_bundle(model, sales, vertical=vertical)
+            rows.append({
+                "Vertical": vertical,
+                "Sales": SALES_LABEL[sales],
+                "FY Target": cell["fy_target"],
+                "YTD Achievement": cell["ytd_ach"],
+                "Target Achieved %": cell["ytd_ach_pct"],
+                "Current Run Rate": cell["current_rr"],
+                "Scenario Run Rate": cell["scen_rr"],
+                "Run Rate Change %": cell["rr_change_pct"],
+                "Current March Projection %": cell["current_march_pct"],
+                "Scenario Milestone %": cell["milestone_pct"],
+                "Scenario March Projection %": cell["march_pct"],
+                "Scenario Revenue": bundle["scenario"]["total"],
+                "Incremental Revenue": bundle["incremental"]["total"],
+            })
+    formats = {
+        "Vertical": "txt", "Sales": "txt", "FY Target": "cr", "YTD Achievement": "cr",
+        "Target Achieved %": "pct", "Current Run Rate": "cr", "Scenario Run Rate": "cr",
+        "Run Rate Change %": "pct_signed", "Current March Projection %": "pct",
+        "Scenario Milestone %": "pct", "Scenario March Projection %": "pct",
+        "Scenario Revenue": "cr1", "Incremental Revenue": "cr1_signed",
+    }
+    return pd.DataFrame(rows), formats
+
+
+def build_asset_breakdown(model: ScenarioModel, sales: str) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """Equity / Debt / Liquid split within each vertical."""
+    rows = []
+    include_dip = model.scenario_id in (3, 7)
+    for vertical in model.available_verticals():
+        for asset in ASSETS:
+            cell = model.cell(sales, asset=asset, vertical=vertical)
+            revenue = _z(cell["march_amount"]) * REVENUE_RATE[asset]
+            baseline_revenue = _z(cell["current_march"]) * REVENUE_RATE[asset]
+            row = {
+                "Vertical": vertical,
+                "Asset": asset,
+                "FY Target": cell["fy_target"],
+                "YTD Achievement": cell["ytd_ach"],
+                "Target Achieved %": cell["ytd_ach_pct"],
+                "Current Run Rate": cell["current_rr"],
+                "Scenario Run Rate": cell["scen_rr"],
+                "Run Rate Change %": cell["rr_change_pct"],
             }
+            if include_dip:
+                row["Feb-Mar Run Rate"] = cell["feb_mar_rr"]
+            row.update({
+                "Current March Projection %": cell["current_march_pct"],
+                "Scenario Milestone %": cell["milestone_pct"],
+                "Scenario March Projection %": cell["march_pct"],
+                "Scenario Revenue": revenue,
+                "Incremental Revenue": revenue - baseline_revenue,
+            })
+            rows.append(row)
+    formats = {
+        "Vertical": "txt", "Asset": "txt", "FY Target": "cr", "YTD Achievement": "cr",
+        "Target Achieved %": "pct", "Current Run Rate": "cr", "Scenario Run Rate": "cr",
+        "Run Rate Change %": "pct_signed", "Feb-Mar Run Rate": "cr",
+        "Current March Projection %": "pct", "Scenario Milestone %": "pct",
+        "Scenario March Projection %": "pct", "Scenario Revenue": "cr1",
+        "Incremental Revenue": "cr1_signed",
+    }
+    return pd.DataFrame(rows), formats
+
+
+def build_segment_scenario_analysis(
+    model: ScenarioModel, sales: str
+) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """Scenario 6 - differentiated performance by business segment."""
+    rows = []
+    for segment in model.available_segments():
+        cell = model.cell(sales, segment=segment)
+        rows.append({
+            "Segment": segment,
+            "FY Target": cell["fy_target"],
+            "YTD Achievement": cell["ytd_ach"],
+            "Current Run Rate": cell["current_rr"],
+            "Current March Projection": cell["current_march"],
+            "Scenario Achievement %": cell["milestone_pct"],
+            "Scenario Target Amount": cell["march_required"],
+            "Scenario Required Run Rate": cell["scen_rr"],
+            "Run Rate Uplift %": cell["rr_change_pct"],
+            "Incremental Amount": cell["incremental_sales"],
+        })
+    overall = model.cell(sales)
+    rows.append({
+        "Segment": "Overall",
+        "FY Target": overall["fy_target"],
+        "YTD Achievement": overall["ytd_ach"],
+        "Current Run Rate": overall["current_rr"],
+        "Current March Projection": overall["current_march"],
+        "Scenario Achievement %": overall["march_pct"],
+        "Scenario Target Amount": overall["march_required"],
+        "Scenario Required Run Rate": overall["scen_rr"],
+        "Run Rate Uplift %": overall["rr_change_pct"],
+        "Incremental Amount": overall["incremental_sales"],
+    })
+    formats = {
+        "Segment": "txt", "FY Target": "cr", "YTD Achievement": "cr",
+        "Current Run Rate": "cr", "Current March Projection": "cr",
+        "Scenario Achievement %": "pct", "Scenario Target Amount": "cr",
+        "Scenario Required Run Rate": "cr", "Run Rate Uplift %": "pct_signed",
+        "Incremental Amount": "cr_signed",
+    }
+    return pd.DataFrame(rows), formats
+
+
+def build_momentum_analysis(cell: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """Scenario 7 - month-by-month momentum trajectory."""
+    trajectory = cell.get("trajectory") or []
+    current_rr = _num(cell.get("current_rr"))
+    growth = cell.get("momentum_g")
+    leakage = _z(cell.get("leakage"))
+    fy_target = cell.get("fy_target")
+    cumulative = _z(cell.get("ytd_ach"))
+
+    rows = []
+    previous = current_rr
+    for position, month in enumerate(FUTURE_MONTHS):
+        run_rate = trajectory[position] if position < len(trajectory) else None
+        cumulative += _z(run_rate)
+        if position < MONTHS_JUL_JAN:
+            mom = growth if growth is not None else safe_div(run_rate, previous)
+            if growth is None and mom is not None:
+                mom = mom - 1.0
+            phase = "Momentum build-up"
+        else:
+            mom = -leakage
+            phase = "Feb-Mar leakage"
+        rows.append({
+            "Month": month,
+            "Phase": phase,
+            "Current Run Rate": current_rr,
+            "Required Scenario Run Rate": run_rate,
+            "MoM Growth": mom,
+            "Cumulative Achievement": cumulative,
+            "Achievement %": safe_div(cumulative, fy_target),
+        })
+        previous = run_rate
+    formats = {
+        "Month": "txt", "Phase": "txt", "Current Run Rate": "cr",
+        "Required Scenario Run Rate": "cr", "MoM Growth": "pct_signed",
+        "Cumulative Achievement": "cr", "Achievement %": "pct",
+    }
+    return pd.DataFrame(rows), formats
+
+
+def build_momentum_by_group(
+    model: ScenarioModel, sales: str, dimension: str
+) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """Scenario 7 applied independently to asset classes or to verticals."""
+    if dimension == "asset":
+        keys = [("Asset", asset, {"asset": asset}) for asset in ASSETS]
+        first_column = "Asset"
+    else:
+        keys = [("Vertical", v, {"vertical": v}) for v in model.available_verticals()]
+        first_column = "Vertical"
+
+    rows = []
+    for _, name, filters in keys:
+        cell = model.cell(sales, **filters)
+        rows.append({
+            first_column: name,
+            "Current Run Rate": cell["current_rr"],
+            "Required MoM Momentum": cell["momentum_g"],
+            "January Achievement": cell["jan_amount"],
+            "January Achievement %": cell["jan_pct"],
+            "Feb-Mar Leakage": cell.get("leakage"),
+            "March Achievement": cell["march_amount"],
+            "March Achievement %": cell["march_pct"],
+            "Headroom / Shortfall": cell["headroom_amt"],
+        })
+    formats = {
+        first_column: "txt", "Current Run Rate": "cr",
+        "Required MoM Momentum": "pct_signed", "January Achievement": "cr",
+        "January Achievement %": "pct", "Feb-Mar Leakage": "pct",
+        "March Achievement": "cr", "March Achievement %": "pct",
+        "Headroom / Shortfall": "cr_signed",
+    }
+    return pd.DataFrame(rows), formats
+
+
+def build_monthly_revenue(model: ScenarioModel, basis: str) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """Scenario 7 - monthly revenue implied by the momentum trajectory."""
+    trajectories = {
+        asset: (model.cell(basis, asset=asset).get("trajectory") or [])
+        for asset in ASSETS
+    }
+    rows = []
+    for position, month in enumerate(FUTURE_MONTHS):
+        row = {"Month": month}
+        total = 0.0
+        for asset in ASSETS:
+            series = trajectories[asset]
+            sales_amount = series[position] if position < len(series) else 0.0
+            revenue = _z(sales_amount) * REVENUE_RATE[asset]
+            row[f"{asset} Revenue"] = revenue
+            total += revenue
+        row["Total Revenue"] = total
+        rows.append(row)
+    formats = {"Month": "txt", "Total Revenue": "cr1"}
+    for asset in ASSETS:
+        formats[f"{asset} Revenue"] = "cr1"
+    return pd.DataFrame(rows), formats
+
+
+def build_leakage_sensitivity(
+    model: ScenarioModel, basis: str
+) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """Scenario 7 - how the March outcome moves with the leakage assumption."""
+    subset = filter_grid(model.grid, sales=basis)
+    fy_target = subset["fy_target"].sum()
+    ytd_target = subset["ytd_target"].sum()
+    ytd_ach = subset["ytd_ach"].sum()
+    rows = []
+    for leakage in (0.0, 0.10, 0.20, 0.30):
+        params = dict(model.params)
+        params["leakage"] = leakage
+        cell = calculate_scenario_7(fy_target, ytd_target, ytd_ach, params)
+        rows.append({
+            "Feb-Mar Leakage": leakage,
+            "Required MoM Momentum": cell["momentum_g"],
+            "January Achievement %": cell["jan_pct"],
+            "March Achievement %": cell["march_pct"],
+            "Headroom / Shortfall": cell["headroom_amt"],
+        })
+    formats = {
+        "Feb-Mar Leakage": "pct", "Required MoM Momentum": "pct_signed",
+        "January Achievement %": "pct", "March Achievement %": "pct",
+        "Headroom / Shortfall": "cr_signed",
+    }
+    return pd.DataFrame(rows), formats
+
+
+def build_scenario_guide(model: ScenarioModel, basis: str) -> pd.DataFrame:
+    rows = []
+    for scenario_id in SCENARIO_ORDER:
+        meta = SCENARIOS[scenario_id]
+        rows.append({
+            "Scenario": meta["label"],
+            "Description": meta["explanation"],
+            "Milestone": meta["milestone"],
+            "Selected": "Yes" if scenario_id == model.scenario_id else "",
+        })
+    rows.append({
+        "Scenario": "Revenue methodology",
+        "Description": (
+            "Revenue is estimated at asset-class level using 60 bps for Equity, 20 bps for Debt "
+            f"and 10 bps for Liquid, applied to {SALES_LABEL[basis]} only so that Gross Sales and "
+            "Net Sales revenue are never double counted."
+        ),
+        "Milestone": "",
+        "Selected": "",
+    })
+    rows.append({
+        "Scenario": "Timeline assumption",
+        "Description": (
+            "April, May and June are complete. Three months completed, nine months remaining "
+            "(July-January is seven months, February-March is two months). The current run rate "
+            "is YTD achievement divided by three."
+        ),
+        "Milestone": "",
+        "Selected": "",
+    })
+    if model.scenario_id == 3:
+        rows.append({
+            "Scenario": "Scenario 3 setting",
+            "Description": f"Feb-Mar run-rate dip: {fmt_pct(model.params.get('dip', S3_DEFAULT_DIP))}",
+            "Milestone": "", "Selected": "",
+        })
+    if model.scenario_id == 7:
+        rows.append({
+            "Scenario": "Scenario 7 settings",
+            "Description": (
+                f"January target: {fmt_pct(model.params.get('jan_target', S7_DEFAULT_JAN_TARGET))} · "
+                f"March target: {fmt_pct(model.params.get('mar_target', S7_DEFAULT_MAR_TARGET))} · "
+                f"Feb-Mar leakage: {fmt_pct(model.params.get('leakage', S7_DEFAULT_LEAKAGE))}"
+            ),
+            "Milestone": "", "Selected": "",
+        })
+    return pd.DataFrame(rows)
+
+
+# =============================================================================
+# 11. EXCEL EXPORT
+# =============================================================================
+
+def _round_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    out = frame.copy()
+    for column in out.columns:
+        if pd.api.types.is_numeric_dtype(out[column]):
+            out[column] = out[column].astype(float).round(4)
+    return out
+
+
+def make_export_excel(model: ScenarioModel, basis: str) -> bytes:
+    """Build the management export workbook for the selected scenario."""
+    sheets: List[Tuple[str, pd.DataFrame]] = []
+    sheets.append(("Scenario Guide", build_scenario_guide(model, basis)))
+    sheets.append(("Current Baseline", build_current_overview(model)[0]))
+    sheets.append(("Current vs Scenario", build_comparison(model)[0]))
+    sheets.append(("Revenue Impact", build_revenue_impact(model, basis)[0]))
+    sheets.append(("Retail-DHNI-VRM Summary", build_vertical_summary(model)[0]))
+    sheets.append(("Gross Sales Breakdown", build_asset_breakdown(model, "GS")[0]))
+    sheets.append(("Net Sales Breakdown", build_asset_breakdown(model, "NS")[0]))
+
+    segment_model = model if model.scenario_id == 6 else ScenarioModel(6, model.grid, model.params)
+    segment_frames = []
+    for sales in SALES_TYPES:
+        frame = build_segment_scenario_analysis(segment_model, sales)[0]
+        frame.insert(0, "Sales", SALES_LABEL[sales])
+        segment_frames.append(frame)
+    sheets.append(("Scenario 6 Segments", pd.concat(segment_frames, ignore_index=True)))
+
+    momentum_model = model if model.scenario_id == 7 else ScenarioModel(7, model.grid, model.params)
+    momentum_frames = []
+    for sales in SALES_TYPES:
+        overall = momentum_model.cell(sales)
+        frame = build_momentum_analysis(overall)[0]
+        frame.insert(0, "Sales", SALES_LABEL[sales])
+        momentum_frames.append(frame)
+    for sales in SALES_TYPES:
+        for dimension in ("asset", "vertical"):
+            frame = build_momentum_by_group(momentum_model, sales, dimension)[0]
+            frame.insert(0, "Sales", SALES_LABEL[sales])
+            momentum_frames.append(frame)
+    sheets.append(("Scenario 7 Momentum", pd.concat(momentum_frames, ignore_index=True)))
+    sheets.append(("S7 Monthly Revenue", build_monthly_revenue(momentum_model, basis)[0]))
+
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        for name, frame in sheets:
+            _round_frame(frame).to_excel(writer, sheet_name=name[:31], index=False)
+        _style_workbook(writer)
+    return buffer.getvalue()
+
+
+def _style_workbook(writer: Any) -> None:
+    """Bold headers, frozen top row and sensible column widths."""
+    try:
+        from openpyxl.styles import Alignment, Font, PatternFill
+    except Exception:  # pragma: no cover - openpyxl always present in the stack
+        return
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill("solid", fgColor="1F2937")
+    for worksheet in writer.book.worksheets:
+        worksheet.freeze_panes = "A2"
+        for cell in worksheet[1]:
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+        for column_cells in worksheet.columns:
+            longest = 0
+            letter = column_cells[0].column_letter
+            for cell in column_cells:
+                value = "" if cell.value is None else str(cell.value)
+                longest = max(longest, min(len(value), 60))
+            worksheet.column_dimensions[letter].width = max(12, min(longest + 3, 62))
+
+
+# =============================================================================
+# 12. PRESENTATION LAYER - THEME
+# =============================================================================
+
+CUSTOM_CSS = """
+<style>
+:root {
+    --ivory: #F7F1E3;
+    --ivory-card: #FFFDF7;
+    --ivory-soft: #F1E7D0;
+    --gold: #B8923B;
+    --gold-deep: #8B6A22;
+    --gold-soft: #D9C48B;
+    --ink: #2F291F;
+    --muted: #756B5A;
+    --green: #2F7D5B;
+    --red: #B64B45;
+}
+
+.stApp, [data-testid="stAppViewContainer"] {
+    background: linear-gradient(180deg, #FBF8EF 0%, var(--ivory) 100%);
+}
+[data-testid="stHeader"] { background: transparent; }
+
+.block-container, [data-testid="stMainBlockContainer"] {
+    padding-top: 1.25rem;
+    padding-bottom: 3rem;
+    max-width: 1680px;
+}
+
+.stApp, .stApp p, .stApp span, .stApp li, .stApp label,
+.stApp h1, .stApp h2, .stApp h3, .stApp h4 {
+    color: var(--ink);
+}
+
+.app-title {
+    font-size: 1.8rem;
+    font-weight: 800;
+    color: var(--ink);
+    margin: 0 0 3px 0;
+    letter-spacing: -0.02em;
+}
+.app-sub {
+    color: var(--muted);
+    font-size: 0.9rem;
+    margin-bottom: 4px;
+}
+.app-rule {
+    height: 1px;
+    background: linear-gradient(90deg, var(--gold), transparent);
+    margin: 12px 0 5px 0;
+}
+
+.section-label {
+    font-size: 0.74rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--gold-deep);
+    font-weight: 800;
+    margin: 22px 0 10px 0;
+    border-left: 4px solid var(--gold);
+    padding: 7px 0 7px 11px;
+    background: linear-gradient(90deg, rgba(184,146,59,.10), transparent 55%);
+    border-radius: 0 8px 8px 0;
+}
+
+.subsection-title {
+    color: var(--gold-deep);
+    font-size: 0.76rem;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin: 13px 0 5px 0;
+}
+
+.note {
+    color: var(--muted);
+    font-size: 0.79rem;
+    line-height: 1.5;
+    margin: 5px 0 12px 0;
+}
+
+.callout, .scenario-highlight {
+    background: var(--ivory-card);
+    border: 1px solid var(--gold-soft);
+    border-left: 4px solid var(--gold);
+    border-radius: 10px;
+    padding: 12px 15px;
+    color: var(--ink);
+    font-size: 0.87rem;
+    line-height: 1.55;
+    margin: 7px 0 12px 0;
+    box-shadow: 0 3px 12px rgba(104, 80, 28, .07);
+}
+.callout-warn { border-left-color: #C27A28; }
+.callout-ok { border-left-color: var(--green); }
+.tag-ok { color: var(--green); font-weight: 700; }
+.tag-warn { color: #A96A22; font-weight: 700; }
+
+[data-testid="stMetric"], [data-testid="metric-container"] {
+    background: linear-gradient(145deg, #FFF8DF 0%, #F3D98E 100%);
+    border: 1px solid #C49B39;
+    border-top: 4px solid #9A741F;
+    border-radius: 12px;
+    padding: 13px 15px 12px 15px;
+    min-height: 108px;
+    box-shadow: 0 4px 14px rgba(93, 71, 24, .07);
+}
+[data-testid="stMetricLabel"], [data-testid="stMetricLabel"] p,
+[data-testid="stMetricLabel"] div {
+    color: var(--muted) !important;
+    font-size: 0.70rem !important;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    font-weight: 700;
+}
+[data-testid="stMetricValue"] {
+    color: var(--ink) !important;
+    font-size: 1.43rem !important;
+    font-weight: 800;
+}
+[data-testid="stMetricDelta"] { font-size: 0.76rem !important; }
+
+[data-testid="stDataFrame"] {
+    border: 1px solid var(--gold-soft);
+    border-radius: 10px;
+    overflow: hidden;
+    background: var(--ivory-card);
+    box-shadow: 0 2px 8px rgba(93, 71, 24, .05);
+}
+
+.stTabs [data-baseweb="tab-list"] {
+    gap: 5px;
+    border-bottom: 1px solid var(--gold-soft);
+}
+.stTabs [data-baseweb="tab"] {
+    color: var(--muted);
+    background: rgba(255,253,247,.55);
+    border-radius: 8px 8px 0 0;
+}
+.stTabs [aria-selected="true"] {
+    color: var(--gold-deep) !important;
+    font-weight: 800;
+    border-bottom: 2px solid var(--gold);
+}
+
+[data-testid="stExpander"] {
+    border: 1px solid var(--gold-soft) !important;
+    border-radius: 10px;
+    background: rgba(255,253,247,.82);
+}
+
+[data-testid="stSidebar"], [data-testid="stSidebarContent"] {
+    background: #F1E6CF !important;
+    border-right: 1px solid var(--gold-soft);
+}
+[data-testid="stSidebar"] * { color: var(--ink) !important; }
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p,
+[data-testid="stSidebar"] small { color: var(--muted) !important; }
+
+[data-testid="stSidebar"] [data-baseweb="select"] > div,
+[data-testid="stSidebar"] [data-baseweb="input"],
+[data-testid="stSidebar"] input,
+[data-baseweb="select"] > div {
+    background: var(--ivory-card) !important;
+    border-color: var(--gold-soft) !important;
+    color: var(--ink) !important;
+    border-radius: 9px !important;
+}
+
+[data-testid="stSidebar"] [data-testid="stExpander"] {
+    background: rgba(255,253,247,.88) !important;
+    border: 1px solid var(--gold-soft) !important;
+}
+
+.sidebar-title {
+    font-size: 0.74rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    font-weight: 800;
+    color: var(--gold-deep);
+    margin-bottom: 7px;
+}
+.sidebar-card {
+    background: var(--ivory-card);
+    border: 1px solid var(--gold-soft);
+    border-left: 4px solid var(--gold);
+    border-radius: 10px;
+    padding: 11px 12px;
+    margin: 5px 0 13px 0;
+    box-shadow: 0 3px 10px rgba(93, 71, 24, .06);
+}
+.sidebar-card .s-name {
+    font-weight: 800;
+    font-size: 0.88rem;
+    color: var(--ink);
+}
+.sidebar-card .s-body {
+    font-size: 0.78rem;
+    color: var(--muted);
+    line-height: 1.5;
+    margin-top: 4px;
+}
+.sidebar-card .s-milestone {
+    font-size: 0.75rem;
+    color: var(--gold-deep);
+    margin-top: 7px;
+    font-weight: 700;
+}
+
+.stButton > button,
+.stDownloadButton > button {
+    background: var(--gold-deep) !important;
+    color: #FFFDF7 !important;
+    border: 1px solid var(--gold-deep) !important;
+    border-radius: 9px !important;
+    font-weight: 700 !important;
+}
+.stButton > button:hover,
+.stDownloadButton > button:hover {
+    background: var(--gold) !important;
+    color: #FFFDF7 !important;
+    border-color: var(--gold) !important;
+}
+
+[data-testid="stVegaLiteChart"] text { fill: var(--ink) !important; }
+[data-testid="stVegaLiteChart"] .role-axis-grid line { stroke: #E5D9BA !important; }
+[data-testid="stVegaLiteChart"] .role-axis line,
+[data-testid="stVegaLiteChart"] .role-axis path { stroke: var(--gold-soft) !important; }
+
+hr { border-color: var(--gold-soft) !important; }
+
+.gold-star-card {
+    background: linear-gradient(145deg, #F4D77B 0%, #C99A2E 100%);
+    border: 1px solid #A77A1D;
+    border-radius: 14px;
+    padding: 16px 15px;
+    min-height: 138px;
+    box-shadow: 0 7px 18px rgba(112, 79, 15, .18);
+    color: #2F291F;
+}
+.gold-star-rank {
+    font-size: .72rem;
+    font-weight: 900;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: #6E5016;
+}
+.gold-star-name {
+    margin-top: 7px;
+    font-size: 1.05rem;
+    font-weight: 900;
+    color: #251E13;
+}
+.gold-star-stat {
+    margin-top: 9px;
+    font-size: .82rem;
+    line-height: 1.55;
+    color: #3E321C;
+}
+.category-pill {
+    display: inline-block;
+    background: #FFF7DC;
+    border: 1px solid #C49B39;
+    color: #765817;
+    padding: 4px 9px;
+    border-radius: 999px;
+    font-size: .72rem;
+    font-weight: 800;
+    margin: 2px 4px 2px 0;
+}
+.final-output-box {
+    background: linear-gradient(135deg, #F3D77F 0%, #C8982F 100%);
+    border: 1px solid #9B711B;
+    border-radius: 13px;
+    padding: 13px 15px;
+    color: #2A2113;
+    box-shadow: 0 6px 16px rgba(103, 73, 14, .16);
+}
+
+</style>
+"""
+
+
+def rerun() -> None:
+    handler = getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None)
+    if handler is not None:
+        handler()
+
+
+def _dataframe_kwargs() -> Dict[str, Any]:
+    try:
+        parameters = inspect.signature(st.dataframe).parameters
+    except (TypeError, ValueError):
+        return {}
+    if "width" in parameters and parameters["width"].default == "stretch":
+        return {}
+    if "use_container_width" in parameters:
+        return {"use_container_width": True}
+    return {}
+
+
+def show_table(frame: pd.DataFrame, formats: Optional[Dict[str, str]] = None) -> None:
+    display = format_table(frame, formats) if formats else frame
+    try:
+        st.dataframe(display, hide_index=True, **_dataframe_kwargs())
+    except TypeError:  # pragma: no cover - very old Streamlit
+        st.dataframe(display)
+
+
+def section(title: str) -> None:
+    st.markdown(f"<div class='section-label'>{title}</div>", unsafe_allow_html=True)
+
+
+def callout(text: str, tone: str = "") -> None:
+    css = "callout" + (f" callout-{tone}" if tone else "")
+    st.markdown(f"<div class='{css}'>{text}</div>", unsafe_allow_html=True)
+
+
+def kpi_row(items: Sequence[Tuple]) -> None:
+    if not items:
+        return
+    columns = st.columns(len(items))
+    for column, item in zip(columns, items):
+        label, value = item[0], item[1]
+        delta = item[2] if len(item) > 2 else None
+        delta_color = item[3] if len(item) > 3 else "normal"
+        with column:
+            if delta is None:
+                st.metric(label, value)
+            else:
+                st.metric(label, value, delta, delta_color=delta_color)
+
+
+# =============================================================================
+# 13. UPLOAD GATE
+# =============================================================================
+
+def render_upload_screen() -> None:
+    _, middle, _ = st.columns([1, 2, 1])
+    with middle:
+        _render_upload_body()
+
+
+def _render_upload_body() -> None:
+    st.markdown(f"<div class='app-title'>{APP_TITLE}</div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='app-sub'>Upload the RM scorecard workbook to open the dashboard. "
+        "Nothing is stored beyond this session.</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("<div class='app-rule'></div>", unsafe_allow_html=True)
+
+    uploaded = st.file_uploader(
+        "Workbook", type=["xlsx", "xlsm"], label_visibility="collapsed",
+    )
+    if uploaded is not None:
+        payload = uploaded.getvalue()
+        try:
+            load_workbook(payload)
+            parse_final_dashboard_metrics(payload)
+        except WorkbookError as error:
+            st.error(str(error))
+        except Exception:  # pragma: no cover - defensive, never show a traceback
+            st.error(
+                "The workbook could not be read. Please check that it is a valid Excel file "
+                "containing RM Retail Sales, RM DHNI, VRM and FINAL."
+            )
+        else:
+            st.session_state["workbook"] = payload
+            rerun()
+
+
+# =============================================================================
+# 14. SIDEBAR
+# =============================================================================
+
+def render_sidebar(records: pd.DataFrame) -> Tuple[int, Dict[str, Any], str, Dict[str, Any]]:
+    sidebar = st.sidebar
+    sidebar.markdown("<div class='sidebar-title'>Scenario Navigator</div>", unsafe_allow_html=True)
+
+    scenario_options = SCENARIO_ORDER
+    scenario_id = sidebar.selectbox(
+        "Scenario",
+        scenario_options,
+        index=0,
+        key="scenario_selector_dropdown",
+        format_func=lambda sid: (
+            f"Scenario {sid} · {SCENARIOS[sid]['name']}"
+        ),
+        label_visibility="collapsed",
+    )
+    meta = SCENARIOS[scenario_id]
+    sidebar.markdown(
+        "<div class='sidebar-card'>"
+        f"<div class='s-name'>Scenario {scenario_id} · {meta['name']}</div>"
+        f"<div class='s-body'>{meta['explanation']}</div>"
+        f"<div class='s-milestone'>Target milestone: {meta['milestone']}</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    params: Dict[str, Any] = {
+        "dip": S3_DEFAULT_DIP,
+        "jan_target": S7_DEFAULT_JAN_TARGET,
+        "mar_target": S7_DEFAULT_MAR_TARGET,
+        "leakage": S7_DEFAULT_LEAKAGE,
+    }
+
+    if scenario_id == 3:
+        sidebar.markdown("<div class='sidebar-title'>Scenario controls</div>", unsafe_allow_html=True)
+        params["dip"] = sidebar.slider(
+            "Feb-Mar Run-Rate Dip", min_value=0, max_value=60,
+            value=int(S3_DEFAULT_DIP * 100), step=5, format="%d%%", key="s3_dip",
+        ) / 100.0
+
+    if scenario_id == 7:
+        sidebar.markdown("<div class='sidebar-title'>Scenario controls</div>", unsafe_allow_html=True)
+        params["jan_target"] = sidebar.slider(
+            "January Achievement Target", min_value=90, max_value=120,
+            value=int(S7_DEFAULT_JAN_TARGET * 100), step=1, format="%d%%", key="s7_jan",
+        ) / 100.0
+        params["mar_target"] = sidebar.slider(
+            "March Achievement Target", min_value=90, max_value=120,
+            value=int(S7_DEFAULT_MAR_TARGET * 100), step=1, format="%d%%", key="s7_mar",
+        ) / 100.0
+        params["leakage"] = sidebar.slider(
+            "Feb-Mar AUM Leakage", min_value=0, max_value=30,
+            value=int(S7_DEFAULT_LEAKAGE * 100), step=1, format="%d%%", key="s7_leak",
+        ) / 100.0
+
+    mapping = render_segment_controls(records)
+
+    with sidebar.expander("Assumptions", expanded=False):
+        st.caption(
+            "Revenue basis: Net Sales only. "
+            "Revenue rates: Equity 60 bps · Debt 20 bps · Liquid 10 bps. "
+            "Timeline: April-June complete, 9 months remaining, "
+            "July-January 7 months, February-March 2 months."
+        )
+    basis = "NS"
+
+    sidebar.markdown("<div class='app-rule'></div>", unsafe_allow_html=True)
+    if sidebar.button("Use another workbook"):
+        reset_workbook()
+
+    return scenario_id, params, basis, mapping
+
+
+def render_segment_controls(records: pd.DataFrame) -> Dict[str, Any]:
+    """Configurable segment classification for Scenario 6."""
+    suggestions = identify_segments(records)
+    mapping: Dict[str, Any] = dict(st.session_state.get("segment_mapping") or suggestions)
+
+    usable_columns = [
+        field for field in META_FIELDS
+        if field in records.columns and text_column(records, field).ne("").any()
+    ]
+
+    with st.sidebar.expander("Segment mapping (Scenario 6)", expanded=False):
+        st.caption(
+            "Digital, Retail B30 and Others are derived from workbook metadata. "
+            "Adjust the classification here; every other record falls into Others."
+        )
+        for segment in ("Digital", "Retail B30"):
+            options = ["(not mapped)"] + usable_columns
+            current = mapping.get(segment, {}).get("column", "(not mapped)")
+            index = options.index(current) if current in options else 0
+            column = st.selectbox(
+                f"{segment} identified by", options, index=index, key=f"seg_col_{segment}",
+            )
+            if column == "(not mapped)":
+                mapping.pop(segment, None)
+                continue
+            values = sorted({v for v in text_column(records, column) if v.strip()})
+            preset = [v for v in mapping.get(segment, {}).get("values", []) if v in values]
+            chosen = st.multiselect(
+                f"{segment} values", values, default=preset,
+                key=f"seg_vals_{segment}_{column}",
+            )
+            if chosen:
+                mapping[segment] = {"column": column, "values": list(chosen)}
+            else:
+                mapping.pop(segment, None)
+
+    st.session_state["segment_mapping"] = mapping
+    return mapping
+
+
+# =============================================================================
+# 15. DASHBOARD SECTIONS
+# =============================================================================
+
+def render_baseline(model: ScenarioModel) -> None:
+    section("Current Baseline")
+    cards = []
+    for sales in SALES_TYPES:
+        base = model.baseline(sales)
+        cards.append((
+            f"{sales} Current Run Rate", fmt_cr(base["current_rr"]),
+            f"{fmt_pct(base['fy_completed_pct'])} of FY target booked", "off",
+        ))
+    for sales in SALES_TYPES:
+        base = model.baseline(sales)
+        delta = None if base["ytd_ach_pct"] is None else fmt_pts(base["ytd_ach_pct"] - 1.0)
+        cards.append((f"{sales} Target Achieved %", fmt_pct(base["ytd_ach_pct"]), delta))
+    for sales in SALES_TYPES:
+        base = model.baseline(sales)
+        delta = None if base["current_march_pct"] is None else fmt_pts(base["current_march_pct"] - 1.0)
+        cards.append((f"{sales} March Projection %", fmt_pct(base["current_march_pct"]), delta))
+    kpi_row(cards)
+    st.markdown(
+        "<div class='note'>Baseline is the Apr-Jun run rate carried forward for nine months. "
+        "It never changes with the selected scenario.</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def scenario_cards(model: ScenarioModel, basis: str) -> List[Tuple]:
+    kind = model.meta["kind"]
+    cards: List[Tuple] = []
+
+    if model.scenario_id == 6:
+        for segment in model.available_segments():
+            cell = model.cell(basis, segment=segment)
+            delta = (
+                None if cell["march_pct"] is None or cell["current_march_pct"] is None
+                else fmt_pts(cell["march_pct"] - cell["current_march_pct"])
+            )
+            cards.append((f"{segment} Achievement", fmt_pct(cell["march_pct"]), delta))
+        overall = model.cell(basis)
+        cards.append((
+            "Overall Achievement", fmt_pct(overall["march_pct"]),
+            None if overall["march_pct"] is None or overall["current_march_pct"] is None
+            else fmt_pts(overall["march_pct"] - overall["current_march_pct"]),
+        ))
+        cards.append((
+            "Scenario March Projection", fmt_cr(overall["march_amount"]),
+            fmt_cr_signed(overall["incremental_sales"]),
+        ))
+        return cards
+
+    if model.scenario_id == 7:
+        cell = model.cell(basis)
+        momentum = cell["momentum_g"]
+        cards.append((
+            "Required MoM Momentum",
+            fmt_pct(momentum) if momentum is not None else NA_TEXT,
+            f"binding: {cell['binding']} milestone" if cell.get("binding") else None, "off",
+        ))
+        cards.append((
+            "January Achievement", fmt_pct(cell["jan_pct"]),
+            fmt_cr_signed(cell["jan_buffer"]) + " buffer" if cell["jan_buffer"] is not None else None,
+        ))
+        cards.append(("Feb-Mar Leakage", fmt_pct(cell.get("leakage")), None))
+        cards.append((
+            "March Achievement", fmt_pct(cell["march_pct"]),
+            None if cell["march_pct"] is None or cell["current_march_pct"] is None
+            else fmt_pts(cell["march_pct"] - cell["current_march_pct"]),
+        ))
+        cards.append((
+            "March Headroom / Shortfall", fmt_cr_signed(cell["headroom_amt"]),
+            fmt_pts(cell["headroom_pct"]) if cell["headroom_pct"] is not None else None,
+        ))
+        cards.append((
+            "January Exit Run Rate", fmt_cr(cell["scen_rr"]),
+            fmt_pct_signed(cell["rr_change_pct"]) if cell["rr_change_pct"] is not None else None,
+        ))
+        return cards
+
+    for sales in SALES_TYPES:
+        cell = model.cell(sales)
+        label = "Scenario Run Rate" if kind == "runrate" else "Required Run Rate"
+        cards.append((
+            f"{sales} {label}", fmt_cr(cell["scen_rr"]),
+            fmt_pct_signed(cell["rr_change_pct"]) if cell["rr_change_pct"] is not None else None,
+        ))
+
+    if kind == "jan_target":
+        for sales in SALES_TYPES:
+            cell = model.cell(sales)
+            cards.append((
+                f"{sales} January Achievement", fmt_pct(cell["jan_pct"]),
+                fmt_cr(cell["jan_amount"]), "off",
+            ))
+    for sales in SALES_TYPES:
+        cell = model.cell(sales)
+        delta = (
+            None if cell["march_pct"] is None or cell["current_march_pct"] is None
+            else fmt_pts(cell["march_pct"] - cell["current_march_pct"])
+        )
+        cards.append((f"{sales} March Achievement", fmt_pct(cell["march_pct"]), delta))
+    return cards
+
+
+def render_comparison(model: ScenarioModel, basis: str) -> None:
+    section(f"Current vs Scenario {model.scenario_id} · {model.meta['name']}")
+    cards = scenario_cards(model, basis)
+    if len(cards) <= 6:
+        kpi_row(cards)
+    else:
+        kpi_row(cards[:4])
+        kpi_row(cards[4:8])
+
+    if model.scenario_id in (2, 5):
+        implied = model.implied_milestones(basis)
+        st.markdown(
+            "<div class='note'>Equity carries the fixed ambition; Debt and Liquid share the "
+            f"residual requirement in FY-target proportion — implied milestone of "
+            f"{fmt_pct(implied['Debt'])} of FY target for both ({SALES_LABEL[basis]}).</div>",
+            unsafe_allow_html=True,
+        )
+    if model.scenario_id == 3:
+        st.markdown(
+            f"<div class='note'>February-March run rate is set at "
+            f"{fmt_pct(1 - model.params['dip'])} of the July-January required run rate.</div>",
+            unsafe_allow_html=True,
+        )
+    if model.scenario_id == 2:
+        st.markdown(
+            "<div class='note'>February-March is assumed to continue at the July-January "
+            "required run rate.</div>",
+            unsafe_allow_html=True,
+        )
+
+
+def render_revenue_kpis(model: ScenarioModel, basis: str) -> Dict[str, Any]:
+    section("Revenue / Earnings Impact")
+    bundle = revenue_bundle(model, basis)
+    baseline_total = bundle["baseline"]["total"]
+    scenario_total = bundle["scenario"]["total"]
+    incremental = bundle["incremental"]
+    kpi_row([
+        ("Baseline Revenue", fmt_cr(baseline_total, 1), "current run rate", "off"),
+        ("Scenario Revenue", fmt_cr(scenario_total, 1), fmt_cr_signed(incremental["total"], 1)),
+        ("Incremental Revenue", fmt_cr_signed(incremental["total"], 1),
+         fmt_pct_signed(incremental["uplift_pct"]) if incremental["uplift_pct"] is not None else None),
+        ("Revenue Uplift %",
+         fmt_pct(incremental["uplift_pct"]) if incremental["uplift_pct"] is not None else NA_TEXT,
+         f"on {SALES_LABEL[basis]}", "off"),
+    ])
+    st.markdown(
+        f"<div class='note'>Revenue is calculated at asset-class level (Equity 60 bps, Debt 20 bps, "
+        f"Liquid 10 bps) on {SALES_LABEL[basis]} only — no blended rate, no double counting.</div>",
+        unsafe_allow_html=True,
+    )
+    return bundle
+
+
+def render_detail_expander(model: ScenarioModel) -> None:
+    with st.expander("Detailed baseline and comparison numbers", expanded=False):
+        st.markdown("**Current baseline**")
+        frame, formats = build_current_overview(model)
+        show_table(frame, formats)
+        st.markdown("**Current vs selected scenario**")
+        frame, formats = build_comparison(model)
+        show_table(frame, formats)
+
+
+def render_vertical_section(model: ScenarioModel) -> None:
+    section("Channel Drill-Down")
+
+    available = model.available_verticals()
+    if not available:
+        st.info("No Retail / DHNI / VRM channel data is available.")
+        return
+
+    selected_vertical = st.selectbox(
+        "Select Channel",
+        available,
+        index=0,
+        key="channel_drilldown",
+        help="Choose Retail, DHNI or VRM to inspect the selected scenario.",
+    )
+
+    frame, formats = build_vertical_summary(model)
+    filtered = frame.loc[frame["Vertical"] == selected_vertical].copy()
+
+    tabs = st.tabs([SALES_LABEL["GS"], SALES_LABEL["NS"]])
+    for tab, sales in zip(tabs, SALES_TYPES):
+        with tab:
+            sales_frame = filtered.loc[filtered["Sales"] == SALES_LABEL[sales]].copy()
+            if not sales_frame.empty:
+                sales_frame = sales_frame.drop(columns=["Vertical", "Sales"])
+                show_table(sales_frame, formats)
+            else:
+                st.info(f"No {SALES_LABEL[sales]} data for {selected_vertical}.")
+
+    st.markdown(
+        "<div class='note'>Choose one channel at a time for a cleaner management view. "
+        "Gross Sales and Net Sales remain alternative revenue bases and are never added together.</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_asset_section(model: ScenarioModel) -> None:
+    section("Asset Class Drill-Down")
+
+    selected_asset = st.selectbox(
+        "Select Asset Class",
+        ASSETS,
+        index=0,
+        key="asset_class_drilldown",
+        help="Choose Equity, Debt or Liquid to compare that asset across channels.",
+    )
+
+    tabs = st.tabs([SALES_LABEL["GS"], SALES_LABEL["NS"]])
+    for tab, sales in zip(tabs, SALES_TYPES):
+        with tab:
+            frame, formats = build_asset_breakdown(model, sales)
+            filtered = frame.loc[frame["Asset"] == selected_asset].copy()
+            if not filtered.empty:
+                filtered = filtered.drop(columns=["Asset"])
+                show_table(filtered, formats)
+            else:
+                st.info(f"No {SALES_LABEL[sales]} data for {selected_asset}.")
+
+
+def render_segment_section(model: ScenarioModel, basis: str, counts: Dict[str, int]) -> None:
+    section("Scenario 6 · Segment Analysis")
+    unmapped = [s for s in ("Digital", "Retail B30") if counts.get(s, 0) == 0]
+    if unmapped:
+        missing = " and ".join(unmapped)
+        callout(
+            f"<b>Segment validation:</b> no records could be reliably classified as {missing} "
+            "from the workbook metadata (MKT TYPE, Type, ZONE, REGION, EM City). "
+            "Those records have <b>not</b> been reallocated — they remain in Others, and the "
+            f"{missing} scenario uplift is therefore not applied. Use "
+            "<i>Segment mapping (Scenario 6)</i> in the sidebar to point the classification at "
+            "the correct column and values.",
+            tone="warn",
+        )
+
+    present = " · ".join(
+        f"{segment} {S6_SEGMENT_TARGETS[segment]:.0%} of FY target ({counts.get(segment, 0)} RMs)"
+        for segment in SEGMENT_ORDER
+    )
+    st.markdown(f"<div class='note'>Scenario assumption — {present}.</div>", unsafe_allow_html=True)
+
+    tabs = st.tabs([SALES_LABEL["GS"], SALES_LABEL["NS"]])
+    for tab, sales in zip(tabs, SALES_TYPES):
+        with tab:
+            frame, formats = build_segment_scenario_analysis(model, sales)
+            show_table(frame, formats)
+
+    overall = model.cell(basis)
+    lines = []
+    for segment in model.available_segments():
+        cell = model.cell(basis, segment=segment)
+        uplift = (
+            fmt_pct_signed(cell["rr_change_pct"]) if cell["rr_change_pct"] is not None else NA_TEXT
+        )
+        lines.append(
+            f"<b>{segment}</b> moves from {fmt_pct(cell['current_march_pct'])} to "
+            f"{fmt_pct(cell['march_pct'])} of FY target, needing {fmt_cr(cell['scen_rr'])} per month "
+            f"({uplift} run-rate uplift)"
+        )
+    callout(
+        f"On {SALES_LABEL[basis]}: " + "; ".join(lines) + ". Overall March achievement moves from "
+        f"{fmt_pct(overall['current_march_pct'])} to {fmt_pct(overall['march_pct'])}, an improvement "
+        f"of {fmt_cr_signed(overall['incremental_sales'])}."
+    )
+
+
+def render_momentum_section(model: ScenarioModel, basis: str) -> None:
+    section("Scenario 7 · Momentum Analysis")
+    cell = model.cell(basis)
+    momentum = cell["momentum_g"]
+
+    kpi_row([
+        ("Current Run Rate", fmt_cr(cell["current_rr"]), f"Apr-Jun, {SALES_LABEL[basis]}", "off"),
+        ("Required MoM Momentum", fmt_pct(momentum) if momentum is not None else NA_TEXT,
+         f"binding: {cell['binding']}" if cell.get("binding") else None, "off"),
+        ("January Target", fmt_cr(cell["jan_required"]),
+         fmt_pct(model.params["jan_target"]) + " of FY target", "off"),
+        ("January Scenario Achievement", fmt_cr(cell["jan_amount"]), fmt_pct(cell["jan_pct"]), "off"),
+    ])
+    kpi_row([
+        ("January Buffer", fmt_cr_signed(cell["jan_buffer"]),
+         fmt_pct_signed(cell["jan_buffer_pct"]) if cell["jan_buffer_pct"] is not None else None),
+        ("Feb-Mar Leakage", fmt_pct(cell.get("leakage")),
+         f"Feb {fmt_cr(cell['feb_mar_rr'])} · Mar {fmt_cr(cell.get('march_rr'))}", "off"),
+        ("March Scenario Achievement", fmt_cr(cell["march_amount"]), fmt_pct(cell["march_pct"]), "off"),
+        ("March Headroom / Shortfall", fmt_cr_signed(cell["headroom_amt"]),
+         fmt_pts(cell["headroom_pct"]) if cell["headroom_pct"] is not None else None),
+    ])
+
+    if cell["feasible"]:
+        callout(
+            "<span class='tag-ok'>✓ TARGET ACHIEVABLE</span> — the momentum trajectory reaches the "
+            f"January milestone and still clears the March ambition after "
+            f"{fmt_pct(cell.get('leakage'))} Feb-Mar leakage.",
+            tone="ok",
         )
     else:
-        summary_df = pd.DataFrame(
+        callout(
+            "<span class='tag-warn'>⚠ ADDITIONAL MOMENTUM REQUIRED</span> — additional March sales "
+            f"required: {fmt_cr(cell.get('additional_march_sales'))}; additional January run rate "
+            f"required: {fmt_cr(cell.get('additional_jan_rr'))} per month.",
+            tone="warn",
+        )
+    if cell.get("note"):
+        st.markdown(f"<div class='note'>{cell['note']}</div>", unsafe_allow_html=True)
+
+    momentum_text = fmt_pct(momentum) if momentum is not None else "a flat required"
+    outcome = (
+        f"{fmt_pct(cell['headroom_pct'])} headroom" if _z(cell["headroom_amt"]) >= 0
+        else f"a {fmt_cr(abs(_z(cell['headroom_amt'])))} shortfall"
+    )
+    callout(
+        f"<b>Momentum required:</b> the business needs to build approximately {momentum_text} "
+        f"month-on-month momentum from July through January — lifting the monthly run rate from "
+        f"{fmt_cr(cell['current_rr'])} to {fmt_cr(cell['scen_rr'])} by January — to reach the "
+        f"{fmt_pct(model.params['jan_target'])} January milestone. With an assumed "
+        f"{fmt_pct(cell.get('leakage'))} February-March leakage, the trajectory delivers "
+        f"{fmt_pct(cell['march_pct'])} achievement by March against a "
+        f"{fmt_pct(model.params['mar_target'])} ambition, creating {outcome}. "
+        f"January buffer created before leakage: {fmt_cr_signed(cell['jan_buffer'])}."
+    )
+
+    st.markdown("**Monthly momentum trajectory**")
+    frame, formats = build_momentum_analysis(cell)
+    show_table(frame, formats)
+
+    trajectory = cell.get("trajectory") or []
+    if trajectory:
+        chart = pd.DataFrame(
             {
-                "Metric": [
-                    "Employees",
-                    "Selected Scenario",
-                    "Total GS Required / Month",
-                    "Total NS Required / Month",
-                ],
-                "Value": [
-                    len(selected_result),
-                    selected_scenario,
-                    selected_result["GS Total Required / Month"].sum(),
-                    selected_result["NS Total Required / Month"].sum(),
-                ],
+                "Current run-rate trajectory": [_z(cell["current_rr"])] * len(trajectory),
+                "Required momentum trajectory": trajectory,
+            },
+            index=MONTH_DATES[: len(trajectory)],
+        )
+        st.line_chart(chart)
+        st.markdown(
+            f"<div class='note'>January 2027 milestone: {fmt_cr(cell['jan_required'])} cumulative "
+            f"({fmt_pct(model.params['jan_target'])} of FY target) — reached at a monthly run rate of "
+            f"{fmt_cr(cell['scen_rr'])}, after which February and March step down by "
+            f"{fmt_pct(cell.get('leakage'))} each.</div>",
+            unsafe_allow_html=True,
+        )
+
+    tabs = st.tabs(["Asset class", "Retail / DHNI / VRM", "Leakage sensitivity", "Monthly revenue"])
+    with tabs[0]:
+        for sales in SALES_TYPES:
+            st.markdown(f"**{SALES_LABEL[sales]}**")
+            frame, formats = build_momentum_by_group(model, sales, "asset")
+            show_table(frame, formats)
+    with tabs[1]:
+        for sales in SALES_TYPES:
+            st.markdown(f"**{SALES_LABEL[sales]}**")
+            frame, formats = build_momentum_by_group(model, sales, "vertical")
+            show_table(frame, formats)
+    with tabs[2]:
+        frame, formats = build_leakage_sensitivity(model, basis)
+        show_table(frame, formats)
+        st.markdown(
+            "<div class='note'>Momentum is re-solved at each leakage assumption, so the required "
+            "July-January build changes with the February-March pressure.</div>",
+            unsafe_allow_html=True,
+        )
+    with tabs[3]:
+        frame, formats = build_monthly_revenue(model, basis)
+        show_table(frame, formats)
+        january_revenue = calculate_revenue(model.assets(basis), "jan_amount")
+        march_revenue = calculate_revenue(model.assets(basis), "march_amount")
+        baseline = calculate_baseline_revenue(model.assets(basis))
+        st.markdown(
+            f"<div class='note'>January scenario revenue {fmt_cr(january_revenue['total'], 1)} · "
+            f"March scenario revenue {fmt_cr(march_revenue['total'], 1)} · baseline "
+            f"{fmt_cr(baseline['total'], 1)} · incremental "
+            f"{fmt_cr_signed(march_revenue['total'] - baseline['total'], 1)}.</div>",
+            unsafe_allow_html=True,
+        )
+
+
+def render_revenue_detail(model: ScenarioModel, basis: str, bundle: Dict[str, Any]) -> None:
+    section("Revenue by Asset Class")
+    frame, formats = build_revenue_impact(model, basis)
+    show_table(frame, formats)
+
+    incremental = bundle["incremental"]
+    parts = " + ".join(
+        f"{asset} {fmt_cr_signed(incremental['by_asset'][asset], 1)}" for asset in ASSETS
+    )
+    contribution = " · ".join(
+        f"{asset} {fmt_pct(incremental['contribution'][asset])}" for asset in ASSETS
+    )
+    callout(
+        f"<b>Revenue bridge:</b> current run-rate revenue {fmt_cr(bundle['baseline']['total'], 1)} "
+        f"+ {parts} = scenario revenue {fmt_cr(bundle['scenario']['total'], 1)}.<br>"
+        f"<b>Scenario revenue contribution:</b> {contribution}."
+    )
+
+
+def render_export(model: ScenarioModel, basis: str) -> None:
+    section("Export")
+    try:
+        payload = make_export_excel(model, basis)
+    except Exception:  # pragma: no cover - defensive
+        st.warning("The export could not be generated for the current selection.")
+        return
+    st.download_button(
+        "Download Selected Scenario Analysis",
+        data=payload,
+        file_name=f"scenario_{model.scenario_id}_analysis.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    st.markdown(
+        "<div class='note'>The workbook contains the scenario guide, baseline, comparison, revenue "
+        "impact, Retail-DHNI-VRM summary, Gross and Net Sales breakdowns, Scenario 6 segment analysis, "
+        "Scenario 7 momentum analysis and Scenario 7 monthly revenue.</div>",
+        unsafe_allow_html=True,
+    )
+
+
+# =============================================================================
+# 15A. RM PERFORMANCE SEGMENTATION PAGE
+# =============================================================================
+
+ACHIEVEMENT_BANDS: List[Tuple[str, float, Optional[float]]] = [
+    ("100% and above", 1.00, None),
+    ("90% - 100%", 0.90, 1.00),
+    ("75% - 90%", 0.75, 0.90),
+    ("50% - 75%", 0.50, 0.75),
+    ("30% - 50%", 0.30, 0.50),
+    ("Less than 30%", float("-inf"), 0.30),
+]
+ACHIEVEMENT_BAND_ORDER: List[str] = [item[0] for item in ACHIEVEMENT_BANDS]
+
+
+def achievement_band(value: Any) -> str:
+    """Map YTD-target achievement to the management bands requested for RMs."""
+    ratio = _num(value)
+    # User requested N/A to be treated/displayed as 0.
+    ratio = 0.0 if ratio is None else ratio
+
+    if ratio >= 1.00:
+        return "100% and above"
+    if ratio >= 0.90:
+        return "90% - 100%"
+    if ratio >= 0.75:
+        return "75% - 90%"
+    if ratio >= 0.50:
+        return "50% - 75%"
+    if ratio >= 0.30:
+        return "30% - 50%"
+    return "Less than 30%"
+
+
+def _rm_identity_columns(records: pd.DataFrame) -> List[str]:
+    preferred = [
+        "Employee Name", "Emp Code", "ADID", "ZONE", "REGION",
+        "EM City", "MKT TYPE", "Type", "Status",
+    ]
+    return [column for column in preferred if column in records.columns]
+
+
+def build_rm_performance_detail(
+    records: pd.DataFrame,
+    vertical: str,
+    sales: str,
+    final_target: Optional[float] = None,
+) -> pd.DataFrame:
+    """
+    Build one row per RM.
+
+    Banding is based on overall YTD achievement / overall YTD target across
+    Equity + Debt + Liquid. Run-rate projection annualises the first three
+    completed months.
+    """
+    subset = records.loc[records["Vertical"] == vertical].copy()
+    if subset.empty:
+        return pd.DataFrame()
+
+    identity = _rm_identity_columns(subset)
+    out = subset[identity].copy()
+
+    fy_cols = [f"{sales}_{asset}_fy" for asset in ASSETS]
+    ytd_target_cols = [f"{sales}_{asset}_ytd_tgt" for asset in ASSETS]
+    ach_cols = [f"{sales}_{asset}_ach" for asset in ASSETS]
+
+    for columns in (fy_cols, ytd_target_cols, ach_cols):
+        for column in columns:
+            if column not in subset.columns:
+                subset[column] = 0.0
+
+    fy_matrix = subset[fy_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    ytd_target_matrix = subset[ytd_target_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    ach_matrix = subset[ach_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+
+    out["FY Target"] = fy_matrix.sum(axis=1)
+    out["YTD Target"] = ytd_target_matrix.sum(axis=1)
+    out["YTD Achievement"] = ach_matrix.sum(axis=1)
+
+    out["YTD Achievement %"] = np.where(
+        out["YTD Target"] > 0,
+        out["YTD Achievement"] / out["YTD Target"],
+        0.0,
+    )
+
+    out["Achievement Category"] = out["YTD Achievement %"].map(achievement_band)
+    out["Current Run Rate"] = out["YTD Achievement"] / max(MONTHS_COMPLETED, 1)
+    out["Estimated FY @ Current RR"] = out["Current Run Rate"] * 12.0
+    out["Projected FY Achievement %"] = np.where(
+        out["FY Target"] > 0,
+        out["Estimated FY @ Current RR"] / out["FY Target"],
+        0.0,
+    )
+
+    denominator = _num(final_target)
+    if denominator is None or denominator <= 0:
+        denominator = _num(out["FY Target"].sum()) or 0.0
+
+    out["Contribution to Overall Target %"] = np.where(
+        denominator > 0,
+        out["Estimated FY @ Current RR"] / denominator,
+        0.0,
+    )
+
+    # Asset-level achieved percentages are useful when drilling into an RM.
+    for asset in ASSETS:
+        fy = pd.to_numeric(subset[f"{sales}_{asset}_fy"], errors="coerce").fillna(0.0)
+        ytd_target = pd.to_numeric(
+            subset[f"{sales}_{asset}_ytd_tgt"], errors="coerce"
+        ).fillna(0.0)
+        ach = pd.to_numeric(subset[f"{sales}_{asset}_ach"], errors="coerce").fillna(0.0)
+
+        out[f"{asset} YTD %"] = np.where(ytd_target > 0, ach / ytd_target, 0.0)
+        out[f"{asset} Current RR"] = ach / max(MONTHS_COMPLETED, 1)
+        out[f"{asset} Projected FY %"] = np.where(
+            fy > 0,
+            (ach / max(MONTHS_COMPLETED, 1) * 12.0) / fy,
+            0.0,
+        )
+
+    out = out.sort_values(
+        ["YTD Achievement %", "YTD Achievement"],
+        ascending=[False, False],
+    ).reset_index(drop=True)
+
+    return out
+
+
+def build_category_contribution(
+    detail: pd.DataFrame,
+    final_target: Optional[float] = None,
+) -> pd.DataFrame:
+    """
+    Aggregate RM bands and quantify how many percentage points each band is
+    projected to contribute to the FINAL FY target at the current run rate.
+    """
+    if detail.empty:
+        return pd.DataFrame()
+
+    target_denominator = _num(final_target)
+    if target_denominator is None or target_denominator <= 0:
+        target_denominator = _num(detail["FY Target"].sum()) or 0.0
+
+    total_projected = _num(detail["Estimated FY @ Current RR"].sum()) or 0.0
+
+    grouped = (
+        detail.groupby("Achievement Category", dropna=False)
+        .agg(
+            **{
+                "RM Count": ("Employee Name", "count"),
+                "FY Target": ("FY Target", "sum"),
+                "YTD Target": ("YTD Target", "sum"),
+                "YTD Achievement": ("YTD Achievement", "sum"),
+                "Current Run Rate": ("Current Run Rate", "sum"),
+                "Estimated FY @ Current RR": ("Estimated FY @ Current RR", "sum"),
             }
         )
+        .reindex(ACHIEVEMENT_BAND_ORDER, fill_value=0)
+        .reset_index()
+    )
+
+    grouped["Current YTD Achievement %"] = np.where(
+        grouped["YTD Target"] > 0,
+        grouped["YTD Achievement"] / grouped["YTD Target"],
+        0.0,
+    )
+    grouped["Category Projected FY %"] = np.where(
+        grouped["FY Target"] > 0,
+        grouped["Estimated FY @ Current RR"] / grouped["FY Target"],
+        0.0,
+    )
+    grouped["Contribution to Overall Target %"] = np.where(
+        target_denominator > 0,
+        grouped["Estimated FY @ Current RR"] / target_denominator,
+        0.0,
+    )
+    grouped["Share of Projected Sales %"] = np.where(
+        total_projected != 0,
+        grouped["Estimated FY @ Current RR"] / total_projected,
+        0.0,
+    )
+
+    return grouped
+
+
+def _final_vertical_target(
+    final_metrics: Dict[str, Any],
+    sales: str,
+    vertical: str,
+) -> Optional[float]:
+    frame = final_metrics.get(sales)
+    if not isinstance(frame, pd.DataFrame) or frame.empty or vertical not in frame.index:
+        return None
+    return _num(frame.loc[vertical].get("FY27 Target"))
+
+
+def _final_vertical_ytd(
+    final_metrics: Dict[str, Any],
+    sales: str,
+    vertical: str,
+) -> Optional[float]:
+    frame = final_metrics.get(sales)
+    if not isinstance(frame, pd.DataFrame) or frame.empty or vertical not in frame.index:
+        return None
+    return _num(frame.loc[vertical].get("YTD"))
+
+
+def _gold_star_card(rank: int, row: pd.Series) -> str:
+    name = escape(str(row.get("Employee Name", "RM")))
+    achievement = fmt_pct(row.get("YTD Achievement %"))
+    projected = fmt_pct(row.get("Projected FY Achievement %"))
+    contribution = fmt_pct(row.get("Contribution to Overall Target %"))
+    rr = fmt_cr(row.get("Current Run Rate"))
+    return (
+        "<div class='gold-star-card'>"
+        f"<div class='gold-star-rank'>Star #{rank}</div>"
+        f"<div class='gold-star-name'>{name}</div>"
+        "<div class='gold-star-stat'>"
+        f"YTD achievement: <b>{achievement}</b><br>"
+        f"Current run rate: <b>{rr}</b><br>"
+        f"Projected FY: <b>{projected}</b><br>"
+        f"Overall-target contribution: <b>{contribution}</b>"
+        "</div></div>"
+    )
+
+
+def render_stars_of_month(detail: pd.DataFrame, vertical: str, sales: str) -> None:
+    section("Stars of the Month")
+
+    if detail.empty:
+        st.info("No RM data is available for the selected view.")
+        return
+
+    # Workbook provides YTD/current-run-rate fields, not a standalone single-month
+    # achievement column. Rank by YTD achievement % and then YTD achievement amount.
+    ranked = detail.sort_values(
+        ["YTD Achievement %", "YTD Achievement"],
+        ascending=[False, False],
+    ).reset_index(drop=True)
+
+    top = ranked.head(3)
+    columns = st.columns(max(len(top), 1))
+    for index, (_, row) in enumerate(top.iterrows(), start=1):
+        with columns[index - 1]:
+            st.markdown(_gold_star_card(index, row), unsafe_allow_html=True)
+
+    st.markdown(
+        "<div class='note'>Stars are ranked from the performance fields available in the "
+        "uploaded scorecard: overall YTD achievement versus YTD target, with YTD achievement "
+        "amount as the tie-breaker. A standalone monthly actual field is not available, so "
+        "the app does not invent a separate monthly score.</div>",
+        unsafe_allow_html=True,
+    )
+
+    top_table = ranked.head(10).copy()
+    columns_to_show = [
+        column
+        for column in [
+            "Employee Name", "Emp Code", "ADID", "REGION", "EM City",
+            "Achievement Category", "YTD Achievement %", "Current Run Rate",
+            "Projected FY Achievement %", "Contribution to Overall Target %",
+        ]
+        if column in top_table.columns
+    ]
+    show_table(
+        top_table[columns_to_show],
+        {
+            "Employee Name": "txt",
+            "Emp Code": "txt",
+            "ADID": "txt",
+            "REGION": "txt",
+            "EM City": "txt",
+            "Achievement Category": "txt",
+            "YTD Achievement %": "pct",
+            "Current Run Rate": "cr",
+            "Projected FY Achievement %": "pct",
+            "Contribution to Overall Target %": "pct",
+        },
+    )
+
+
+def render_rm_sales_segmentation(
+    records: pd.DataFrame,
+    final_metrics: Dict[str, Any],
+    vertical: str,
+    sales: str,
+) -> None:
+    final_target = _final_vertical_target(final_metrics, sales, vertical)
+    final_ytd = _final_vertical_ytd(final_metrics, sales, vertical)
+
+    detail = build_rm_performance_detail(
+        records,
+        vertical=vertical,
+        sales=sales,
+        final_target=final_target,
+    )
+    if detail.empty:
+        st.info(f"No RM records are available for {vertical} · {SALES_LABEL[sales]}.")
+        return
+
+    contribution = build_category_contribution(detail, final_target=final_target)
+
+    projected_total = _num(detail["Estimated FY @ Current RR"].sum()) or 0.0
+    ytd_total = _num(detail["YTD Achievement"].sum()) or 0.0
+    ytd_target_total = _num(detail["YTD Target"].sum()) or 0.0
+    rm_count = len(detail)
+
+    ytd_pct = ytd_total / ytd_target_total if ytd_target_total > 0 else 0.0
+    projected_pct = (
+        projected_total / final_target
+        if final_target is not None and final_target > 0
+        else (
+            projected_total / (_num(detail["FY Target"].sum()) or 1.0)
+        )
+    )
+
+    high_performers = int(
+        detail["Achievement Category"]
+        .isin(["100% and above", "90% - 100%"])
+        .sum()
+    )
+
+    kpi_row([
+        ("Total RMs", fmt_num(rm_count), f"{vertical} · {SALES_LABEL[sales]}", "off"),
+        ("YTD Achievement vs YTD Target", fmt_pct(ytd_pct),
+         fmt_cr(ytd_total), "off"),
+        ("Projected FY Achievement", fmt_pct(projected_pct),
+         fmt_cr(projected_total), "off"),
+        ("90%+ RMs", fmt_num(high_performers),
+         fmt_pct(high_performers / rm_count if rm_count else 0.0), "off"),
+        ("FINAL FY27 Target", fmt_cr(final_target),
+         "management target", "off"),
+    ])
+
+    section("RM Achievement Segmentation")
+
+    count_map = dict(
+        zip(
+            contribution["Achievement Category"],
+            contribution["RM Count"],
+        )
+    )
+    count_cards = []
+    for band in ACHIEVEMENT_BAND_ORDER:
+        count_cards.append(
+            (
+                band,
+                fmt_num(count_map.get(band, 0)),
+                "RMs",
+                "off",
+            )
+        )
+    # Keep six bands readable by using two rows.
+    kpi_row(count_cards[:3])
+    kpi_row(count_cards[3:])
+
+    count_chart = (
+        contribution[["Achievement Category", "RM Count"]]
+        .set_index("Achievement Category")
+        .reindex(ACHIEVEMENT_BAND_ORDER)
+    )
+    st.bar_chart(count_chart)
+
+    section("Category Run-Rate Contribution to Overall Target")
+    st.markdown(
+        "<div class='note'>Each category's RMs are annualised at their current run rate. "
+        "The projected amount is then divided by the FY27 target from the FINAL sheet for "
+        "the same channel and sales basis. Therefore the contribution percentages show "
+        "how many percentage points each RM category is expected to add to the overall "
+        "target achievement if its current pace continues.</div>",
+        unsafe_allow_html=True,
+    )
+
+    contribution_display = contribution.copy()
+    show_table(
+        contribution_display,
+        {
+            "Achievement Category": "txt",
+            "RM Count": "num",
+            "FY Target": "cr",
+            "YTD Target": "cr",
+            "YTD Achievement": "cr",
+            "Current YTD Achievement %": "pct",
+            "Current Run Rate": "cr",
+            "Estimated FY @ Current RR": "cr",
+            "Category Projected FY %": "pct",
+            "Contribution to Overall Target %": "pct",
+            "Share of Projected Sales %": "pct",
+        },
+    )
+
+    contribution_chart = contribution[
+        ["Achievement Category", "Contribution to Overall Target %"]
+    ].copy()
+    contribution_chart["Contribution to Overall Target %"] *= 100.0
+    contribution_chart = contribution_chart.set_index("Achievement Category").reindex(
+        ACHIEVEMENT_BAND_ORDER
+    )
+    st.bar_chart(contribution_chart)
+
+    total_contribution = _num(
+        contribution["Contribution to Overall Target %"].sum()
+    ) or 0.0
+    st.markdown(
+        "<div class='final-output-box'>"
+        f"<b>Final run-rate output · {vertical} · {SALES_LABEL[sales]}</b><br>"
+        f"At the current RM run rates, the six categories together are projected to deliver "
+        f"<b>{fmt_pct(total_contribution)}</b> of the FINAL FY27 target"
+        + (
+            f" ({fmt_cr(final_target)})."
+            if final_target is not None
+            else "."
+        )
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+
+    section("RM Drill-Down by Achievement Category")
+    selected_band = st.selectbox(
+        "Achievement Category",
+        ACHIEVEMENT_BAND_ORDER,
+        index=0,
+        key=f"rm_band_{vertical}_{sales}",
+    )
+
+    rm_rows = detail.loc[detail["Achievement Category"] == selected_band].copy()
+    if rm_rows.empty:
+        st.info(f"No RMs fall in {selected_band} for this selection.")
+    else:
+        display_columns = [
+            column
+            for column in [
+                "Employee Name", "Emp Code", "ADID", "ZONE", "REGION", "EM City",
+                "Achievement Category", "FY Target", "YTD Target", "YTD Achievement",
+                "YTD Achievement %", "Current Run Rate", "Estimated FY @ Current RR",
+                "Projected FY Achievement %", "Contribution to Overall Target %",
+                "Equity YTD %", "Debt YTD %", "Liquid YTD %",
+            ]
+            if column in rm_rows.columns
+        ]
+        show_table(
+            rm_rows[display_columns],
+            {
+                "Employee Name": "txt",
+                "Emp Code": "txt",
+                "ADID": "txt",
+                "ZONE": "txt",
+                "REGION": "txt",
+                "EM City": "txt",
+                "Achievement Category": "txt",
+                "FY Target": "cr",
+                "YTD Target": "cr",
+                "YTD Achievement": "cr",
+                "YTD Achievement %": "pct",
+                "Current Run Rate": "cr",
+                "Estimated FY @ Current RR": "cr",
+                "Projected FY Achievement %": "pct",
+                "Contribution to Overall Target %": "pct",
+                "Equity YTD %": "pct",
+                "Debt YTD %": "pct",
+                "Liquid YTD %": "pct",
+            },
+        )
+
+    render_stars_of_month(detail, vertical, sales)
+
+
+def make_rm_segmentation_export(
+    records: pd.DataFrame,
+    final_metrics: Dict[str, Any],
+) -> bytes:
+    """Downloadable workbook covering every vertical and both sales bases."""
+    output = io.BytesIO()
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        original_df.to_excel(writer, sheet_name="Uploaded Data", index=False)
-        control_df.to_excel(writer, sheet_name="Scenario Control", index=False)
-        summary_df.to_excel(writer, sheet_name="Scenario Summary", index=False)
-        selected_result.to_excel(writer, sheet_name="Selected Case", index=False)
-        all_results.to_excel(writer, sheet_name="All Cases", index=False)
+        for vertical in VERTICALS:
+            for sales in SALES_TYPES:
+                final_target = _final_vertical_target(final_metrics, sales, vertical)
+                detail = build_rm_performance_detail(
+                    records, vertical, sales, final_target
+                )
+                contribution = build_category_contribution(detail, final_target)
+                stars = (
+                    detail.sort_values(
+                        ["YTD Achievement %", "YTD Achievement"],
+                        ascending=[False, False],
+                    )
+                    .head(10)
+                    .copy()
+                )
 
-        for sheet_name in writer.book.sheetnames:
-            ws = writer.book[sheet_name]
+                prefix = f"{vertical}-{sales}"
+                detail.to_excel(
+                    writer,
+                    sheet_name=f"{prefix}-RM"[:31],
+                    index=False,
+                )
+                contribution.to_excel(
+                    writer,
+                    sheet_name=f"{prefix}-Bands"[:31],
+                    index=False,
+                )
+                stars.to_excel(
+                    writer,
+                    sheet_name=f"{prefix}-Stars"[:31],
+                    index=False,
+                )
+
+        for ws in writer.book.worksheets:
             ws.freeze_panes = "A2"
-            ws.auto_filter.ref = ws.dimensions
-
             for cell in ws[1]:
                 cell.font = cell.font.copy(bold=True)
-
-            for column_cells in ws.columns:
-                max_len = 0
-                column_letter = column_cells[0].column_letter
-                for cell in column_cells[:100]:
-                    value = "" if cell.value is None else str(cell.value)
-                    max_len = max(max_len, len(value))
-                ws.column_dimensions[column_letter].width = min(
-                    max(max_len + 2, 12), 34
+            for cells in ws.columns:
+                width = max(
+                    (len(str(cell.value or "")) for cell in cells[:150]),
+                    default=10,
+                )
+                ws.column_dimensions[cells[0].column_letter].width = min(
+                    max(width + 2, 12),
+                    36,
                 )
 
     output.seek(0)
     return output.getvalue()
 
 
-def display_result_table(result: pd.DataFrame, mode: str) -> None:
-    is_forecast = (
-        "Scenario" in result.columns
-        and not result.empty
-        and result["Scenario"].iloc[0] == FORECAST_NAME
+
+def _clean_filter_values(series: pd.Series) -> List[str]:
+    """Return sorted non-empty values for RM filter dropdowns."""
+    cleaned = (
+        series.astype(str)
+        .str.replace("\u00a0", " ", regex=False)
+        .str.strip()
     )
+    cleaned = cleaned[
+        cleaned.ne("")
+        & cleaned.str.lower().ne("nan")
+        & cleaned.str.lower().ne("none")
+    ]
+    return sorted(cleaned.drop_duplicates().tolist(), key=lambda value: value.lower())
 
-    if is_forecast and mode == "Gross Sales":
-        desired = [
-            *METADATA_COLUMNS,
-            "GS Equity FY Target",
-            "GS Equity YTD Achievement",
-            "GS Equity Current Run Rate / Month",
-            "GS Equity Projected FY Achievement",
-            "GS Equity Projected FY %",
-            "GS Debt FY Target",
-            "GS Debt YTD Achievement",
-            "GS Debt Current Run Rate / Month",
-            "GS Debt Projected FY Achievement",
-            "GS Debt Projected FY %",
-            "GS Liquid FY Target",
-            "GS Liquid YTD Achievement",
-            "GS Liquid Current Run Rate / Month",
-            "GS Liquid Projected FY Achievement",
-            "GS Liquid Projected FY %",
-            "GS Total Current Run Rate / Month",
-            "GS Total Projected FY Achievement",
-            "GS Overall Projected FY %",
-        ]
-    elif is_forecast:
-        desired = [
-            *METADATA_COLUMNS,
-            "NS Equity FY Target",
-            "NS Equity YTD Achievement",
-            "NS Equity Current Run Rate / Month",
-            "NS Equity Projected FY Achievement",
-            "NS Equity Projected FY %",
-            "NS Debt FY Target",
-            "NS Debt YTD Achievement",
-            "NS Debt Current Run Rate / Month",
-            "NS Debt Projected FY Achievement",
-            "NS Debt Projected FY %",
-            "NS Liquid FY Target",
-            "NS Liquid YTD Achievement",
-            "NS Liquid Current Run Rate / Month",
-            "NS Liquid Projected FY Achievement",
-            "NS Liquid Projected FY %",
-            "NS Total Current Run Rate / Month",
-            "NS Total Projected FY Achievement",
-            "NS Overall Projected FY %",
-        ]
-    elif mode == "Gross Sales":
-        desired = [
-            *METADATA_COLUMNS,
-            "GS Equity Final Target",
-            "GS Equity Required / Month",
-            "GS Debt Final Target",
-            "GS Debt Required / Month",
-            "GS Liquid Final Target",
-            "GS Liquid Required / Month",
-            "GS Total Required / Month",
-            "GS Scenario Overall %",
-        ]
-    else:
-        desired = [
-            *METADATA_COLUMNS,
-            "NS Equity Final Target",
-            "NS Equity Required / Month",
-            "NS Debt Final Target",
-            "NS Debt Required / Month",
-            "NS Liquid Final Target",
-            "NS Liquid Required / Month",
-            "NS Total Required / Month",
-            "NS Scenario Overall %",
-        ]
 
-    columns = [c for c in desired if c in result.columns]
-    display_df = result[columns].copy()
+def _apply_exact_text_filter(
+    frame: pd.DataFrame,
+    column: str,
+    selected: str,
+) -> pd.DataFrame:
+    """Apply one exact dropdown filter while treating 'All' as no filter."""
+    if selected == "All" or column not in frame.columns:
+        return frame
 
-    format_map = {}
-    for col in display_df.columns:
-        if col.endswith("%"):
-            format_map[col] = st.column_config.NumberColumn(col, format="%.1f%%")
-            display_df[col] = display_df[col] * 100
-        elif "Target" in col or "Achievement" in col or "/ Month" in col:
-            format_map[col] = st.column_config.NumberColumn(col, format="%,.0f")
-
-    st.dataframe(
-        display_df,
-        use_container_width=True,
-        hide_index=True,
-        column_config=format_map,
-        height=520,
+    values = (
+        frame[column]
+        .astype(str)
+        .str.replace("\u00a0", " ", regex=False)
+        .str.strip()
     )
+    return frame.loc[values == selected].copy()
 
 
-
-# -------------------------------------------------------------------
-# Five-sheet workbook dashboard helpers
-# -------------------------------------------------------------------
-REQUIRED_WORKBOOK_SHEETS = [
-    "Summary",
-    "Summary - Achievement",
-    "RM Retail Sales",
-    "RM DHNI",
-    "VRM",
-]
-
-VERTICAL_SHEETS = {
-    "Retail": "RM Retail Sales",
-    "DHNI": "RM DHNI",
-    "VRM": "VRM",
-}
-
-ACHIEVEMENT_BANDS = [
-    "Greater than 100%",
-    "80% - 100%",
-    "50% - 80%",
-    "30% - 50%",
-    "below 30%",
-    "NA",
-]
-
-
-def compact_raw_sheet(df: pd.DataFrame) -> pd.DataFrame:
-    """Remove completely blank rows/columns while preserving workbook layout values."""
-    if df is None or df.empty:
-        return pd.DataFrame()
-    out = df.copy()
-    out = out.dropna(axis=0, how="all").dropna(axis=1, how="all")
-    return out
-
-
-def duplicate_family_columns(df: pd.DataFrame, base_name: str) -> list:
-    """Return repeated Excel headers in left-to-right order (e.g. Scenario 1, Scenario 1.1...)."""
-    pattern = re.compile(rf"^{re.escape(base_name)}(?:\.\d+)?$")
-    return [str(c) for c in df.columns if pattern.match(str(c))]
-
-
-def safe_sum(df: pd.DataFrame, column: str) -> float:
-    if column not in df.columns:
-        return 0.0
-    return float(clean_numeric(df[column]).sum())
-
-
-def scenario_component_sums_from_sheet(
-    df: pd.DataFrame,
-    assumptions: Dict[str, float],
-) -> Dict[str, Dict[str, Dict[str, float]]]:
+def render_retail_rm_filters(records: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]]:
     """
-    Aggregate the Scenario 1/2/3 run-rate columns already present in a detailed sheet.
+    Cascading Retail-only filters for the second page.
 
-    The employee workbook repeats Scenario 1/2/3 once for each component in this order:
-    GS Equity, GS Debt, GS Liquid, NS Equity, NS Debt, NS Liquid.
-    If those repeated source columns are unavailable, fall back to the app's calculation
-    engine so the dashboard remains usable.
+    Filter order:
+      ZONE -> REGION -> MKT TYPE
+
+    The returned dataframe keeps DHNI/VRM untouched and replaces only Retail
+    rows with the filtered Retail population. This means the same dataframe can
+    safely be used by the page and by the downloadable workbook.
     """
-    result = {
-        "GS": {asset: {} for asset in ["Equity", "Debt", "Liquid"]},
-        "NS": {asset: {} for asset in ["Equity", "Debt", "Liquid"]},
+    retail = records.loc[records["Vertical"] == "Retail"].copy()
+
+    selections: Dict[str, str] = {
+        "ZONE": "All",
+        "REGION": "All",
+        "MKT TYPE": "All",
     }
-    mapping = [
-        ("GS", "Equity"),
-        ("GS", "Debt"),
-        ("GS", "Liquid"),
-        ("NS", "Equity"),
-        ("NS", "Debt"),
-        ("NS", "Liquid"),
+
+    st.markdown(
+        "<div class='subsection-title'>Retail RM Filters</div>",
+        unsafe_allow_html=True,
+    )
+
+    filter_cols = st.columns(3)
+
+    # -------------------------
+    # ZONE
+    # -------------------------
+    zone_options = ["All"]
+    if "ZONE" in retail.columns:
+        zone_options += _clean_filter_values(retail["ZONE"])
+
+    with filter_cols[0]:
+        selections["ZONE"] = st.selectbox(
+            "ZONE",
+            zone_options,
+            index=0,
+            key="retail_rm_zone_filter",
+            help="Filter Retail RMs by zone.",
+        )
+
+    filtered_retail = _apply_exact_text_filter(
+        retail,
+        "ZONE",
+        selections["ZONE"],
+    )
+
+    # -------------------------
+    # REGION — cascades from ZONE
+    # -------------------------
+    region_options = ["All"]
+    if "REGION" in filtered_retail.columns:
+        region_options += _clean_filter_values(filtered_retail["REGION"])
+
+    with filter_cols[1]:
+        selections["REGION"] = st.selectbox(
+            "REGION",
+            region_options,
+            index=0,
+            key=f"retail_rm_region_filter_{selections['ZONE']}",
+            help="Region options automatically narrow after selecting a zone.",
+        )
+
+    filtered_retail = _apply_exact_text_filter(
+        filtered_retail,
+        "REGION",
+        selections["REGION"],
+    )
+
+    # -------------------------
+    # MKT TYPE — cascades from ZONE + REGION
+    # -------------------------
+    market_options = ["All"]
+    if "MKT TYPE" in filtered_retail.columns:
+        market_options += _clean_filter_values(filtered_retail["MKT TYPE"])
+
+    with filter_cols[2]:
+        selections["MKT TYPE"] = st.selectbox(
+            "MKT TYPE",
+            market_options,
+            index=0,
+            key=(
+                f"retail_rm_market_filter_"
+                f"{selections['ZONE']}_{selections['REGION']}"
+            ),
+            help="Market Type options narrow after the selected zone and region.",
+        )
+
+    filtered_retail = _apply_exact_text_filter(
+        filtered_retail,
+        "MKT TYPE",
+        selections["MKT TYPE"],
+    )
+
+    # Keep all non-Retail rows unchanged. Replace Retail with the selected slice.
+    non_retail = records.loc[records["Vertical"] != "Retail"].copy()
+    filtered_records = pd.concat(
+        [filtered_retail, non_retail],
+        ignore_index=True,
+        sort=False,
+    )
+
+    active_filters = [
+        f"{column}: {value}"
+        for column, value in selections.items()
+        if value != "All"
     ]
 
-    source_ok = True
-    scenario_families = {}
-    for scenario in ["Scenario 1", "Scenario 2", "Scenario 3"]:
-        cols = duplicate_family_columns(df, scenario)
-        scenario_families[scenario] = cols
-        if len(cols) < 6:
-            source_ok = False
+    active_text = " · ".join(active_filters) if active_filters else "All Retail RMs"
 
-    if source_ok:
-        for scenario, cols in scenario_families.items():
-            for idx, (mode, asset) in enumerate(mapping):
-                result[mode][asset][scenario] = safe_sum(df, cols[idx])
-        return result
+    st.markdown(
+        "<div class='callout'>"
+        f"<b>Retail population:</b> {len(filtered_retail):,} RM(s)<br>"
+        f"<b>Active filters:</b> {escape(active_text)}"
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
-    # Fallback: use the application's scenario engine. Scenario 1/3 use 9 months;
-    # Scenario 2 uses 7 months to mirror the workbook Summary horizon headings.
-    fallback_months = {"Scenario 1": 9, "Scenario 2": 7, "Scenario 3": 9}
-    result_columns = {
-        "GS": {
-            "Equity": "GS Equity Required / Month",
-            "Debt": "GS Debt Required / Month",
-            "Liquid": "GS Liquid Required / Month",
-        },
-        "NS": {
-            "Equity": "NS Equity Required / Month",
-            "Debt": "NS Debt Required / Month",
-            "Liquid": "NS Liquid Required / Month",
-        },
+    return filtered_records, selections
+
+
+
+def render_rm_segmentation_page(records: pd.DataFrame, payload: bytes) -> None:
+    """Second application page dedicated to RM achievement segmentation."""
+    final_metrics = parse_final_dashboard_metrics(payload)
+
+    st.markdown(
+        "<div class='app-title'>RM Performance Segmentation & Contribution Analysis</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        "<div class='app-sub'>Retail · DHNI · VRM | Achievement bands → run-rate "
+        "contribution to FINAL target → Stars of the Month</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("<div class='app-rule'></div>", unsafe_allow_html=True)
+
+    st.markdown(
+        "<span class='category-pill'>100% and above</span>"
+        "<span class='category-pill'>90% - 100%</span>"
+        "<span class='category-pill'>75% - 90%</span>"
+        "<span class='category-pill'>50% - 75%</span>"
+        "<span class='category-pill'>30% - 50%</span>"
+        "<span class='category-pill'>Less than 30%</span>",
+        unsafe_allow_html=True,
+    )
+
+    vertical = st.selectbox(
+        "Select RM Channel",
+        VERTICALS,
+        index=0,
+        key="rm_seg_vertical",
+        help="Switch between Retail, DHNI and VRM.",
+    )
+
+    page_records = records
+    retail_filter_selections: Dict[str, str] = {
+        "ZONE": "All",
+        "REGION": "All",
+        "MKT TYPE": "All",
     }
-    for scenario, months in fallback_months.items():
-        calculated = calculate_scenario(df, scenario, months, assumptions)
-        for mode in ["GS", "NS"]:
-            for asset in ["Equity", "Debt", "Liquid"]:
-                column = result_columns[mode][asset]
-                result[mode][asset][scenario] = float(calculated[column].sum())
-    return result
 
+    # Retail gets the requested extra management filters.
+    # DHNI and VRM continue to use their full populations.
+    if vertical == "Retail":
+        page_records, retail_filter_selections = render_retail_rm_filters(records)
 
-def build_sales_summary(
-    vertical_frames: Dict[str, pd.DataFrame],
-    mode: str,
-    months_completed: int,
-    assumptions: Dict[str, float],
-) -> pd.DataFrame:
-    """Build the Gross Sales / Net Sales vertical summary shown in the workbook dashboard."""
-    completed = max(int(months_completed), 1)
-
-    if mode == "GS":
-        target_cols = {
-            "Equity": "FY 26 TGT EQ",
-            "Debt": "FY 26 TGT DT",
-            "Liquid": "FY 26 TGT LIQ",
-        }
-        ach_cols = {
-            "Equity": "Equity GS Ach YTD June",
-            "Debt": "Debt GS Ach",
-            "Liquid": "Liquid GS Ach",
-        }
-    else:
-        target_cols = {
-            "Equity": "FY 26 TGT EQ NS",
-            "Debt": "FY 26 TGT DT NS",
-            "Liquid": "FY 26 TGT LIQ NS",
-        }
-        ach_cols = {
-            "Equity": "Equity NS Ach YTD June",
-            "Debt": "Debt NS Ach",
-            "Liquid": "Liquid NS Ach",
-        }
-
-    rows = []
-    for vertical, df in vertical_frames.items():
-        scenario_sums = scenario_component_sums_from_sheet(df, assumptions)
-
-        target_by_asset = {asset: safe_sum(df, col) for asset, col in target_cols.items()}
-        actual_by_asset = {asset: safe_sum(df, col) for asset, col in ach_cols.items()}
-        current_by_asset = {
-            asset: actual_by_asset[asset] / completed for asset in ["Equity", "Debt", "Liquid"]
-        }
-
-        row = {
-            ("Overall", "Total FY Target"): sum(target_by_asset.values()),
-            ("Overall", "Q1 Actuals"): sum(actual_by_asset.values()),
-            ("Overall", "Q1 Actual Run Rate"): sum(actual_by_asset.values()) / completed,
-        }
-
-        for scenario in ["Scenario 1", "Scenario 2", "Scenario 3"]:
-            row[("Overall", scenario)] = sum(
-                scenario_sums[mode][asset][scenario] for asset in ["Equity", "Debt", "Liquid"]
+    tabs = st.tabs([SALES_LABEL["GS"], SALES_LABEL["NS"]])
+    for tab, sales in zip(tabs, SALES_TYPES):
+        with tab:
+            render_rm_sales_segmentation(
+                page_records,
+                final_metrics,
+                vertical,
+                sales,
             )
 
-        for asset in ["Equity", "Debt", "Liquid"]:
-            row[(asset, "Current")] = current_by_asset[asset]
-            for scenario in ["Scenario 1", "Scenario 2", "Scenario 3"]:
-                row[(asset, scenario)] = scenario_sums[mode][asset][scenario]
-
-        rows.append((vertical, row))
-
-    summary = pd.DataFrame([row for _, row in rows], index=[v for v, _ in rows])
-    summary.index.name = "Vertical"
-    summary.columns = pd.MultiIndex.from_tuples(summary.columns)
-
-    if not summary.empty:
-        summary.loc["Total"] = summary.sum(axis=0, numeric_only=True)
-
-    ordered_columns = [
-        ("Overall", "Total FY Target"),
-        ("Overall", "Q1 Actuals"),
-        ("Overall", "Q1 Actual Run Rate"),
-        ("Overall", "Scenario 1"),
-        ("Overall", "Scenario 2"),
-        ("Overall", "Scenario 3"),
-    ]
-    for asset in ["Equity", "Debt", "Liquid"]:
-        ordered_columns.extend(
-            [
-                (asset, "Current"),
-                (asset, "Scenario 1"),
-                (asset, "Scenario 2"),
-                (asset, "Scenario 3"),
+    section("Download RM Segmentation Analysis")
+    try:
+        export_payload = make_rm_segmentation_export(page_records, final_metrics)
+        st.download_button(
+            "Download Full RM Segmentation Workbook",
+            data=export_payload,
+            file_name="rm_performance_segmentation.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        if vertical == "Retail":
+            active = [
+                f"{name}: {value}"
+                for name, value in retail_filter_selections.items()
+                if value != "All"
             ]
-        )
-    return summary.reindex(columns=pd.MultiIndex.from_tuples(ordered_columns))
-
-
-def achievement_percentage(
-    df: pd.DataFrame,
-    target_column: str,
-    achievement_column: str,
-    explicit_percent_column: str | None = None,
-) -> pd.Series:
-    """Return decimal achievement ratios; NaN means the percentage is not applicable."""
-    if explicit_percent_column and explicit_percent_column in df.columns:
-        raw = pd.to_numeric(df[explicit_percent_column], errors="coerce")
-        # Excel percentages are usually decimals, but tolerate files containing 80 instead of 0.80.
-        non_null = raw.dropna()
-        if not non_null.empty and non_null.abs().median() > 3:
-            raw = raw / 100.0
-        return raw
-
-    if target_column not in df.columns or achievement_column not in df.columns:
-        return pd.Series(np.nan, index=df.index, dtype=float)
-
-    target = pd.to_numeric(df[target_column], errors="coerce")
-    achievement = pd.to_numeric(df[achievement_column], errors="coerce")
-    valid = target.notna() & (target > 0) & achievement.notna()
-    ratio = pd.Series(np.nan, index=df.index, dtype=float)
-    ratio.loc[valid] = achievement.loc[valid] / target.loc[valid]
-    return ratio
-
-
-def classify_achievement(value: float) -> str:
-    if pd.isna(value):
-        return "NA"
-    if value > 1.0:
-        return "Greater than 100%"
-    if value >= 0.80:
-        return "80% - 100%"
-    if value >= 0.50:
-        return "50% - 80%"
-    if value >= 0.30:
-        return "30% - 50%"
-    return "below 30%"
-
-
-def build_achievement_summary(
-    vertical_frames: Dict[str, pd.DataFrame],
-    mode: str,
-) -> pd.DataFrame:
-    """Count brokers in the requested achievement bands for Equity, Debt and Liquid."""
-    if mode == "GS":
-        specs = {
-            "Equity": ("YTD June EQ TGT", "Equity GS Ach YTD June", "Equity GS % Ach YTD June"),
-            "Debt": ("YTD June DT TGT", "Debt GS Ach", "Debt GS Ach%"),
-            "Liquid": ("YTD June LIQ TGT", "Liquid GS Ach", "Liquid GS Ach %"),
-        }
-    else:
-        specs = {
-            "Equity": ("YTD June EQ NS TGT", "Equity NS Ach YTD June", None),
-            "Debt": ("YTD June DT NS TGT", "Debt NS Ach", None),
-            "Liquid": ("YTD June LIQ NS TGT", "Liquid NS Ach", None),
-        }
-
-    output = pd.DataFrame(index=ACHIEVEMENT_BANDS)
-    output.index.name = "Achievement"
-
-    for vertical, df in vertical_frames.items():
-        employee_mask = pd.Series(True, index=df.index)
-        if "Employee Name" in df.columns:
-            names = df["Employee Name"].astype(str).str.strip()
-            employee_mask = df["Employee Name"].notna() & names.ne("") & names.ne("nan")
-
-        for asset, (target_col, achievement_col, pct_col) in specs.items():
-            ratios = achievement_percentage(df, target_col, achievement_col, pct_col)
-            bands = ratios.loc[employee_mask].map(classify_achievement)
-            counts = bands.value_counts()
-            output[(vertical, asset)] = [int(counts.get(band, 0)) for band in ACHIEVEMENT_BANDS]
-
-    output.columns = pd.MultiIndex.from_tuples(output.columns)
-
-    # Gross Sales in the user's workbook normally has no NA row. Hide it when it is zero everywhere.
-    if mode == "GS" and "NA" in output.index and int(output.loc["NA"].sum()) == 0:
-        output = output.drop(index="NA")
-
-    output.loc["Total"] = output.sum(axis=0, numeric_only=True)
-    return output
-
-
-def flatten_multiindex_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Flatten MultiIndex columns for Excel export while keeping the Streamlit view grouped."""
-    out = df.copy()
-    if isinstance(out.columns, pd.MultiIndex):
-        out.columns = [" | ".join(str(x) for x in col if str(x) != "") for col in out.columns]
-    return out.reset_index()
-
-
-def make_multisheet_download_excel(
-    raw_summary: pd.DataFrame,
-    raw_summary_achievement: pd.DataFrame,
-    vertical_frames: Dict[str, pd.DataFrame],
-    gross_summary: pd.DataFrame,
-    net_summary: pd.DataFrame,
-    gross_achievement: pd.DataFrame,
-    net_achievement: pd.DataFrame,
-    selected_scenario: str,
-    months_remaining: int,
-    assumptions: Dict[str, float],
-) -> bytes:
-    """Export source views plus recalculated dashboard tables and all existing case calculations."""
-    output = io.BytesIO()
-
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        compact_raw_sheet(raw_summary).to_excel(
-            writer, sheet_name="Source Summary", index=False, header=False
-        )
-        compact_raw_sheet(raw_summary_achievement).to_excel(
-            writer, sheet_name="Source Summary-Ach", index=False, header=False
-        )
-        flatten_multiindex_columns(gross_summary).to_excel(
-            writer, sheet_name="Calc Gross Summary", index=False
-        )
-        flatten_multiindex_columns(net_summary).to_excel(
-            writer, sheet_name="Calc Net Summary", index=False
-        )
-        flatten_multiindex_columns(gross_achievement).to_excel(
-            writer, sheet_name="Calc GS Achievement", index=False
-        )
-        flatten_multiindex_columns(net_achievement).to_excel(
-            writer, sheet_name="Calc NS Achievement", index=False
-        )
-
-        for vertical, df in vertical_frames.items():
-            safe_vertical = vertical[:20]
-            df.to_excel(writer, sheet_name=f"{safe_vertical} Data"[:31], index=False)
-            selected = calculate_scenario(df, selected_scenario, months_remaining, assumptions)
-            selected.to_excel(
-                writer, sheet_name=f"{safe_vertical} Selected"[:31], index=False
+            st.caption(
+                "Retail sheets in this download use the current filters"
+                + (f" ({' · '.join(active)})." if active else " (All Retail RMs).")
+                + " DHNI and VRM remain unfiltered."
             )
-            all_cases = calculate_all_scenarios(df, months_remaining, assumptions)
-            all_cases.to_excel(
-                writer, sheet_name=f"{safe_vertical} All Cases"[:31], index=False
-            )
+    except Exception:
+        st.warning("The RM segmentation export could not be generated.")
 
-        for ws in writer.book.worksheets:
-            ws.freeze_panes = "A2"
-            if ws.max_row >= 1 and ws.max_column >= 1:
-                ws.auto_filter.ref = ws.dimensions
-            for cell in ws[1]:
-                cell.font = cell.font.copy(bold=True)
-            for column_cells in ws.columns:
-                max_len = 0
-                column_letter = column_cells[0].column_letter
-                for cell in column_cells[:100]:
-                    value = "" if cell.value is None else str(cell.value)
-                    max_len = max(max_len, len(value))
-                ws.column_dimensions[column_letter].width = min(max(max_len + 2, 12), 34)
-
-    output.seek(0)
-    return output.getvalue()
+    st.markdown(
+        "<div class='note'>Missing / undefined numeric outputs are displayed as 0, "
+        "as requested.</div>",
+        unsafe_allow_html=True,
+    )
 
 
-def render_case_explanation(
-    selected_scenario: str,
-    months_completed: int,
-    months_remaining: int,
-    s1: float,
-    s2: float,
-    s3_eq: float,
-    s3_overall: float,
-    s4_eq: float,
-    s4_overall: float,
-) -> None:
-    if selected_scenario == FORECAST_NAME:
-        st.info(
-            f"**Current Run Rate Forecast:** Uses performance from the first {months_completed} completed month(s) to calculate the current monthly pace.  \n"
-            "If the same pace continues for the full year, it projects the FY achievement percentage; no target scenario is imposed."
+def render_page_navigation() -> str:
+    st.sidebar.markdown(
+        "<div class='sidebar-title'>Application Page</div>",
+        unsafe_allow_html=True,
+    )
+    page = st.sidebar.selectbox(
+        "Application Page",
+        [
+            "Executive Scenario Dashboard",
+            "RM Performance Segmentation",
+        ],
+        index=0,
+        key="application_page_selector",
+        label_visibility="collapsed",
+    )
+    st.sidebar.markdown("<div class='app-rule'></div>", unsafe_allow_html=True)
+    return page
+
+
+
+# =============================================================================
+# 16. APPLICATION ENTRY POINT
+# =============================================================================
+
+def render_dashboard(records: pd.DataFrame, payload: bytes) -> None:
+    scenario_id, params, basis, mapping = render_sidebar(records)
+    records = map_business_segments(records, mapping)
+    segment_counts = segment_diagnostics(records)
+    grid = build_base_grid(records)
+    model = ScenarioModel(scenario_id, grid, params)
+
+    final_metrics = parse_final_dashboard_metrics(payload)
+
+    st.markdown(f"<div class='app-title'>{APP_TITLE}</div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='app-sub'>FINAL management metrics → selected scenario comparison → "
+        "required future run rate → revenue impact</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("<div class='app-rule'></div>", unsafe_allow_html=True)
+
+    # Single-screen management flow:
+    # 1. FINAL current metrics
+    # 2. selected scenario against the same metrics
+    # 3. all existing scenario / revenue detail
+    render_final_metric_baseline(final_metrics, model)
+    render_final_scenario_comparison(final_metrics, model, basis)
+    render_current_runrate_metric_grid(final_metrics, model)
+
+    bundle = render_revenue_kpis(model, basis)
+    render_detail_expander(model)
+
+    render_vertical_section(model)
+    render_asset_section(model)
+
+    if scenario_id == 6:
+        render_segment_section(model, basis, segment_counts)
+    if scenario_id == 7:
+        render_momentum_section(model, basis)
+
+    render_revenue_detail(model, basis, bundle)
+
+    with st.expander("Source FINAL sheet", expanded=False):
+        st.markdown(
+            "<div class='note'>Reference view of the workbook's FINAL sheet. "
+            "It is part of this same dashboard screen and is not a separate application view.</div>",
+            unsafe_allow_html=True,
         )
-    elif selected_scenario == "Scenario 1":
-        st.info(
-            f"**Scenario 1:** Assumes the employee should finish the year at {s1:.0f}% of the overall FY target.  \n"
-            f"The app calculates the Equity, Debt and Liquid monthly requirement over the remaining {months_remaining} month(s)."
-        )
-    elif selected_scenario == "Scenario 2":
-        st.info(
-            f"**Scenario 2:** Assumes the employee should finish the year at {s2:.0f}% of the overall FY target.  \n"
-            "The app increases the required run rate accordingly and shows the monthly Equity, Debt and Liquid requirement."
-        )
-    elif selected_scenario == "Scenario 3":
-        st.info(
-            f"**Scenario 3:** Fixes Equity achievement at {s3_eq:.0f}% while targeting {s3_overall:.0f}% overall FY achievement.  \n"
-            "The remaining requirement is distributed between Debt and Liquid in proportion to their FY targets."
-        )
-    else:
-        st.info(
-            f"**Scenario 4:** Fixes Equity achievement at {s4_eq:.0f}% and requires at least {s4_overall:.0f}% overall FY achievement.  \n"
-            "Debt and Liquid are adjusted proportionally so the employee reaches the minimum overall target."
-        )
+        st.markdown(build_final_sheet_html(payload), unsafe_allow_html=True)
+
+    render_export(model, basis)
 
 
-def render_vertical_dashboard(
-    vertical: str,
-    df: pd.DataFrame,
-    selected_scenario: str,
-    months_remaining: int,
-    assumptions: Dict[str, float],
-    s1: float,
-    s2: float,
-    s3_eq: float,
-    s3_overall: float,
-    s4_eq: float,
-    s4_overall: float,
-) -> None:
-    valid, missing_columns = validate_input(df)
-    if not valid:
+def reset_workbook() -> None:
+    for key in ("workbook", "segment_mapping", "application_page_selector"):
+        st.session_state.pop(key, None)
+    rerun()
+
+
+def main() -> None:
+    st.set_page_config(
+        page_title=APP_TITLE, page_icon="▮", layout="wide", initial_sidebar_state="expanded",
+    )
+    st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+    if "workbook" not in st.session_state:
+        render_upload_screen()
+        return
+
+    try:
+        records = load_workbook(st.session_state["workbook"])
+    except WorkbookError as error:
+        st.error(str(error))
+        if st.button("Use another workbook"):
+            reset_workbook()
+        return
+    except Exception:  # never surface a raw traceback to management
         st.error(
-            f"{vertical} is missing required calculation columns:\n\n"
-            + "\n".join(f"- {c}" for c in missing_columns)
+            "The workbook could not be read. Please upload the standard RM scorecard workbook "
+            "containing RM Retail Sales, RM DHNI, VRM and FINAL."
         )
-        st.dataframe(df, use_container_width=True, hide_index=True, height=520)
+        if st.button("Use another workbook"):
+            reset_workbook()
         return
 
-    selected_result = calculate_scenario(df, selected_scenario, months_remaining, assumptions)
-    employees_count = len(selected_result)
-    months_completed = max(12 - int(months_remaining), 1)
+    page = render_page_navigation()
 
-    st.subheader(f"{vertical} — Employee Performance")
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Selected Case", selected_scenario)
-    m2.metric("Employees", f"{employees_count:,}")
-
-    if selected_scenario == FORECAST_NAME:
-        gs_target_total = selected_result["GS Total FY Target"].sum()
-        gs_projected_total = selected_result["GS Total Projected FY Achievement"].sum()
-        ns_target_total = selected_result["NS Total FY Target"].sum()
-        ns_projected_total = selected_result["NS Total Projected FY Achievement"].sum()
-        gs_pct = gs_projected_total / gs_target_total if gs_target_total > 0 else 0.0
-        ns_pct = ns_projected_total / ns_target_total if ns_target_total > 0 else 0.0
-        m3.metric("GS Projected FY %", f"{gs_pct * 100:.1f}%")
-        m4.metric("NS Projected FY %", f"{ns_pct * 100:.1f}%")
-    else:
-        m3.metric("GS Required / Month", f'{selected_result["GS Total Required / Month"].sum():,.0f}')
-        m4.metric("NS Required / Month", f'{selected_result["NS Total Required / Month"].sum():,.0f}')
-
-    render_case_explanation(
-        selected_scenario,
-        months_completed,
-        months_remaining,
-        s1,
-        s2,
-        s3_eq,
-        s3_overall,
-        s4_eq,
-        s4_overall,
-    )
-
-    gs_tab, ns_tab, raw_tab = st.tabs(["Gross Sales", "Net Sales", "Uploaded Data"])
-    with gs_tab:
-        display_result_table(selected_result, "Gross Sales")
-    with ns_tab:
-        display_result_table(selected_result, "Net Sales")
-    with raw_tab:
-        st.dataframe(df, use_container_width=True, hide_index=True, height=520)
-
-    st.markdown("#### Employee drill-down")
-    employee_options = selected_result["Employee Name"].dropna().astype(str).tolist()
-    if not employee_options:
-        st.info("No employee names are available for drill-down.")
-        return
-
-    employee = st.selectbox(
-        "Choose employee",
-        options=employee_options,
-        key=f"employee_{vertical}",
-    )
-    emp = selected_result[selected_result["Employee Name"].astype(str) == employee].iloc[0]
-    c1, c2 = st.columns(2)
-
-    if selected_scenario == FORECAST_NAME:
-        with c1:
-            st.markdown("**Gross Sales projected FY achievement**")
-            st.write(
-                {
-                    "Equity": f'{emp["GS Equity Projected FY %"] * 100:.1f}%',
-                    "Debt": f'{emp["GS Debt Projected FY %"] * 100:.1f}%',
-                    "Liquid": f'{emp["GS Liquid Projected FY %"] * 100:.1f}%',
-                    "Overall": f'{emp["GS Overall Projected FY %"] * 100:.1f}%',
-                }
-            )
-            st.caption(f'Current GS run rate: {emp["GS Total Current Run Rate / Month"]:,.2f} per month')
-        with c2:
-            st.markdown("**Net Sales projected FY achievement**")
-            st.write(
-                {
-                    "Equity": f'{emp["NS Equity Projected FY %"] * 100:.1f}%',
-                    "Debt": f'{emp["NS Debt Projected FY %"] * 100:.1f}%',
-                    "Liquid": f'{emp["NS Liquid Projected FY %"] * 100:.1f}%',
-                    "Overall": f'{emp["NS Overall Projected FY %"] * 100:.1f}%',
-                }
-            )
-            st.caption(f'Current NS run rate: {emp["NS Total Current Run Rate / Month"]:,.2f} per month')
-    else:
-        with c1:
-            st.markdown("**Gross Sales monthly requirement**")
-            st.write(
-                {
-                    "Equity": round(emp["GS Equity Required / Month"], 2),
-                    "Debt": round(emp["GS Debt Required / Month"], 2),
-                    "Liquid": round(emp["GS Liquid Required / Month"], 2),
-                    "Total": round(emp["GS Total Required / Month"], 2),
-                }
-            )
-        with c2:
-            st.markdown("**Net Sales monthly requirement**")
-            st.write(
-                {
-                    "Equity": round(emp["NS Equity Required / Month"], 2),
-                    "Debt": round(emp["NS Debt Required / Month"], 2),
-                    "Liquid": round(emp["NS Liquid Required / Month"], 2),
-                    "Total": round(emp["NS Total Required / Month"], 2),
-                }
-            )
-
-
-# -------------------------------------------------------------------
-# UI
-# -------------------------------------------------------------------
-st.title("Employee Performance Forecast & Scenario Planner")
-st.caption(
-    "Upload the five-sheet workbook to view management summaries, achievement-band counts, "
-    "and the existing employee-level forecast/scenario analysis for Retail, DHNI and VRM."
-)
-
-uploaded_file = st.file_uploader(
-    "Upload employee performance Excel",
-    type=["xlsx", "xlsm"],
-    help=(
-        "Expected sheets: Summary, Summary - Achievement, RM Retail Sales, RM DHNI and VRM. "
-        "All five are read by the application."
-    ),
-)
-
-with st.expander("Expected detailed-sheet columns"):
-    st.write(
-        "RM Retail Sales, RM DHNI and VRM use the same employee-level structure. "
-        "Extra columns are allowed."
-    )
-    st.code("\n".join(EXPECTED_INPUT_COLUMNS), language=None)
-    st.markdown("**Mandatory columns used by the employee calculations**")
-    st.code("\n".join(REQUIRED_COLUMNS), language=None)
-
-if uploaded_file is None:
-    st.info("Upload the five-sheet Excel workbook to start.")
-    st.stop()
-
-try:
-    xls = pd.ExcelFile(uploaded_file, engine="openpyxl")
-except Exception as exc:
-    st.error(f"Could not read the Excel file: {exc}")
-    st.stop()
-
-missing_sheets = [name for name in REQUIRED_WORKBOOK_SHEETS if name not in xls.sheet_names]
-if missing_sheets:
-    st.error(
-        "The workbook is missing these required sheets:\n\n"
-        + "\n".join(f"- {name}" for name in missing_sheets)
-        + "\n\nSheets found: "
-        + ", ".join(xls.sheet_names)
-    )
-    st.stop()
-
-# Read ALL five sheets. Summary sheets are loaded raw to preserve their multi-row/merged layout.
-raw_summary = pd.read_excel(xls, sheet_name="Summary", header=None)
-raw_summary_achievement = pd.read_excel(xls, sheet_name="Summary - Achievement", header=None)
-
-vertical_frames = {}
-for vertical, sheet in VERTICAL_SHEETS.items():
-    detail_df = pd.read_excel(xls, sheet_name=sheet)
-    vertical_frames[vertical] = normalize_input_columns(detail_df)
-
-st.success(
-    "Loaded all five sheets: Summary, Summary - Achievement, RM Retail Sales, RM DHNI and VRM."
-)
-
-# ---------------- Global controls retained from the earlier app ----------------
-st.sidebar.header("Forecast / Scenario Controls")
-selected_scenario = st.sidebar.selectbox("Selected Case", SCENARIO_NAMES)
-months_remaining = st.sidebar.number_input(
-    "Months Remaining",
-    min_value=1,
-    max_value=11,
-    value=9,
-    step=1,
-    help=(
-        "For Q1 / YTD June, keep 9 months remaining = 3 months completed. "
-        "This drives the Current Run Rate Forecast and detailed scenario calculations."
-    ),
-)
-
-st.sidebar.subheader("Current Run Rate Forecast")
-st.sidebar.caption(
-    "No target assumption is imposed. Actual YTD performance is annualised at the current monthly pace."
-)
-
-s1 = 100.0
-s2 = 120.0
-s3_eq = 100.0
-s3_overall = 120.0
-s4_eq = 110.0
-s4_overall = 85.0
-
-if selected_scenario == "Scenario 1":
-    st.sidebar.subheader("Scenario 1")
-    s1 = st.sidebar.number_input(
-        "Overall target %", 0.0, 300.0, s1, 5.0, key="s1"
-    )
-elif selected_scenario == "Scenario 2":
-    st.sidebar.subheader("Scenario 2")
-    s2 = st.sidebar.number_input(
-        "Overall target %", 0.0, 300.0, s2, 5.0, key="s2"
-    )
-elif selected_scenario == "Scenario 3":
-    st.sidebar.subheader("Scenario 3")
-    s3_eq = st.sidebar.number_input(
-        "Equity target %", 0.0, 300.0, s3_eq, 5.0, key="s3_eq"
-    )
-    s3_overall = st.sidebar.number_input(
-        "Overall target %", 0.0, 300.0, s3_overall, 5.0, key="s3_overall"
-    )
-elif selected_scenario == "Scenario 4":
-    st.sidebar.subheader("Scenario 4")
-    s4_eq = st.sidebar.number_input(
-        "Equity target %", 0.0, 300.0, s4_eq, 5.0, key="s4_eq"
-    )
-    s4_overall = st.sidebar.number_input(
-        "Minimum overall target %", 0.0, 300.0, s4_overall, 5.0, key="s4_overall"
-    )
-
-assumptions = {
-    "scenario1_overall": s1 / 100,
-    "scenario2_overall": s2 / 100,
-    "scenario3_equity": s3_eq / 100,
-    "scenario3_overall": s3_overall / 100,
-    "scenario4_equity": s4_eq / 100,
-    "scenario4_overall_min": s4_overall / 100,
-}
-
-months_completed = max(12 - int(months_remaining), 1)
-
-# Validate detailed sheets, but keep the dashboard visible so problems are sheet-specific.
-validation_issues = {}
-for vertical, frame in vertical_frames.items():
-    valid, missing = validate_input(frame)
-    if not valid:
-        validation_issues[vertical] = missing
-
-if validation_issues:
-    with st.expander("Detailed-sheet validation warnings", expanded=True):
-        for vertical, missing in validation_issues.items():
-            st.warning(f"{vertical}: missing " + ", ".join(missing))
-
-# New management summaries.
-valid_vertical_frames = {
-    vertical: frame
-    for vertical, frame in vertical_frames.items()
-    if vertical not in validation_issues
-}
-
-gross_summary = build_sales_summary(valid_vertical_frames, "GS", months_completed, assumptions)
-net_summary = build_sales_summary(valid_vertical_frames, "NS", months_completed, assumptions)
-gross_achievement = build_achievement_summary(valid_vertical_frames, "GS")
-net_achievement = build_achievement_summary(valid_vertical_frames, "NS")
-
-summary_tab, achievement_tab, retail_tab, dhni_tab, vrm_tab = st.tabs(
-    ["Summary", "Summary - Achievement", "RM Retail Sales", "RM DHNI", "VRM"]
-)
-
-with summary_tab:
-    st.header("Summary")
-    st.caption(
-        "Gross Sales and Net Sales below are recalculated from RM Retail Sales, RM DHNI and VRM. "
-        "The workbook's original Summary is also shown so Gross SIP+STP, Net SIP+STP and Alternate remain visible."
-    )
-
-    st.subheader("Gross Sales")
-    st.dataframe(
-        gross_summary.style.format("{:,.0f}"),
-        use_container_width=True,
-        height=260,
-    )
-    st.caption(
-        f"Current = Q1 actual run rate using {months_completed} completed month(s). "
-        "Scenario 1/2/3 use the scenario run-rate columns already present in each detailed sheet."
-    )
-
-    st.subheader("Net Sales")
-    st.dataframe(
-        net_summary.style.format("{:,.0f}"),
-        use_container_width=True,
-        height=260,
-    )
-
-    st.markdown("#### Source Summary sheet — includes SIP+STP and Alternate")
-    source_summary_view = compact_raw_sheet(raw_summary)
-    st.dataframe(source_summary_view, use_container_width=True, hide_index=True, height=620)
-
-with achievement_tab:
-    st.header("Summary - Achievement — Number of Brokers")
-    st.caption(
-        "Broker counts are recalculated from the three detailed vertical sheets using YTD achievement percentages. "
-        "If a Net Sales YTD target is missing or non-positive, that broker/component is classified as NA."
-    )
-
-    st.subheader("Gross Sales")
-    st.dataframe(gross_achievement, use_container_width=True, height=310)
-
-    st.subheader("Net Sales")
-    st.dataframe(net_achievement, use_container_width=True, height=340)
-
-    with st.expander("Source Summary - Achievement sheet"):
-        st.dataframe(
-            compact_raw_sheet(raw_summary_achievement),
-            use_container_width=True,
-            hide_index=True,
-            height=620,
+    try:
+        if page == "RM Performance Segmentation":
+            render_rm_segmentation_page(records, st.session_state["workbook"])
+            st.sidebar.markdown("<div class='app-rule'></div>", unsafe_allow_html=True)
+            if st.sidebar.button("Use another workbook", key="rm_page_change_workbook"):
+                reset_workbook()
+        else:
+            render_dashboard(records, st.session_state["workbook"])
+    except Exception:  # never surface a raw traceback to management
+        st.error(
+            "This view could not be prepared from the uploaded workbook. Please select another "
+            "page/scenario, or upload a workbook that matches the standard RM scorecard format."
         )
 
-with retail_tab:
-    render_vertical_dashboard(
-        "Retail",
-        vertical_frames["Retail"],
-        selected_scenario,
-        months_remaining,
-        assumptions,
-        s1,
-        s2,
-        s3_eq,
-        s3_overall,
-        s4_eq,
-        s4_overall,
-    )
 
-with dhni_tab:
-    render_vertical_dashboard(
-        "DHNI",
-        vertical_frames["DHNI"],
-        selected_scenario,
-        months_remaining,
-        assumptions,
-        s1,
-        s2,
-        s3_eq,
-        s3_overall,
-        s4_eq,
-        s4_overall,
-    )
-
-with vrm_tab:
-    render_vertical_dashboard(
-        "VRM",
-        vertical_frames["VRM"],
-        selected_scenario,
-        months_remaining,
-        assumptions,
-        s1,
-        s2,
-        s3_eq,
-        s3_overall,
-        s4_eq,
-        s4_overall,
-    )
-
-# ---------------- Download: source + recalculated summaries + previous case outputs ----------------
-excel_bytes = make_multisheet_download_excel(
-    raw_summary=raw_summary,
-    raw_summary_achievement=raw_summary_achievement,
-    vertical_frames=valid_vertical_frames,
-    gross_summary=gross_summary,
-    net_summary=net_summary,
-    gross_achievement=gross_achievement,
-    net_achievement=net_achievement,
-    selected_scenario=selected_scenario,
-    months_remaining=months_remaining,
-    assumptions=assumptions,
-)
-
-st.download_button(
-    "Download five-sheet dashboard calculations",
-    data=excel_bytes,
-    file_name="employee_5sheet_dashboard_results.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    use_container_width=True,
-)
+if __name__ == "__main__":
+    main()

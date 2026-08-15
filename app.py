@@ -1332,6 +1332,64 @@ def render_current_runrate_metric_grid(
             _render_metric_bifurcation(display, formats)
  
  
+
+def render_final_aum_section(final_metrics: Dict[str, Any]) -> None:
+    """Render the FINAL sheet AUM block using the same Target / Current structure as Excel."""
+    aum = final_metrics.get("AUM")
+    if not isinstance(aum, pd.DataFrame) or aum.empty:
+        st.info("AUM metrics could not be located in the FINAL sheet.")
+        return
+
+    section("AUM · FINAL")
+
+    display = aum.reset_index().rename(columns={"Metric": "Scope"})
+    # Preserve the exact management columns represented in Excel, while adding
+    # the two useful derived fields already calculated by the parser.
+    columns = [c for c in ["Scope", "Target", "Current", "Achievement %", "Gap to Target"] if c in display.columns]
+    display = display[columns]
+
+    formats = {
+        "Scope": "txt",
+        "Target": "cr",
+        "Current": "cr",
+        "Achievement %": "pct",
+        "Gap to Target": "cr_signed",
+    }
+
+    overall = display.loc[display["Scope"] == "Overall"]
+    assets = display.loc[display["Scope"].isin(FINAL_ASSET_ROWS)]
+    channels = display.loc[~display["Scope"].isin(["Overall", *FINAL_ASSET_ROWS])]
+
+    if not overall.empty:
+        st.markdown("<div class='subsection-title'>Overall</div>", unsafe_allow_html=True)
+        show_table(overall, formats)
+
+    if not assets.empty:
+        st.markdown("<div class='subsection-title'>Asset Class</div>", unsafe_allow_html=True)
+        show_table(assets, formats)
+
+    if not channels.empty:
+        st.markdown("<div class='subsection-title'>Channel</div>", unsafe_allow_html=True)
+        show_table(channels, formats)
+
+    # Management KPI treatment, visually aligned with the rest of the liquid-glass UI.
+    if not overall.empty:
+        row = overall.iloc[0]
+        kpi_row([
+            ("AUM Target", fmt_cr(row.get("Target")), "FINAL", "off"),
+            ("AUM Current", fmt_cr(row.get("Current")),
+             fmt_pct(row.get("Achievement %")) if _num(row.get("Achievement %")) is not None else None),
+            ("AUM Gap", fmt_cr_signed(row.get("Gap to Target")), "Target − Current", "off"),
+        ])
+
+    st.markdown(
+        "<div class='note'>AUM is read directly from the workbook's <b>FINAL</b> sheet. "
+        "Target and Current follow the Excel structure; Achievement % and Gap to Target "
+        "are derived from those same two values.</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def render_final_metric_baseline(
     final_metrics: Dict[str, Any],
     model: "ScenarioModel",
@@ -4694,6 +4752,7 @@ def render_dashboard(records: pd.DataFrame, payload: bytes) -> None:
     # 2. selected scenario against the same metrics
     # 3. all existing scenario / revenue detail
     render_final_metric_baseline(final_metrics, model)
+    render_final_aum_section(final_metrics)
     render_final_scenario_comparison(final_metrics, model, basis)
     render_current_runrate_metric_grid(final_metrics, model)
  

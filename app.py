@@ -3,41 +3,41 @@
  SALES PERFORMANCE, SCENARIO PLANNING & REVENUE IMPACT DASHBOARD
 =============================================================================
  Senior-management decision-support application for asset-management sales.
-
+ 
  Run with:
      streamlit run app.py
-
+ 
  Stack: Python | Streamlit | Pandas | NumPy | OpenPyXL
 =============================================================================
 """
-
+ 
 from __future__ import annotations
-
+ 
 import inspect
 import io
 from html import escape
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-
+ 
 import numpy as np
 import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook as openpyxl_load_workbook
-
+ 
 # =============================================================================
 # 1. APPLICATION CONFIGURATION  (management assumptions only - no business data)
 # =============================================================================
-
+ 
 APP_TITLE = "Sales Performance Scenario Planner"
 APP_SUBTITLE = (
     "Current state → selected management scenario → required future state → revenue impact"
 )
-
+ 
 # --- Financial-year timeline -------------------------------------------------
 MONTHS_COMPLETED = 3        # April, May, June are complete
 MONTHS_REMAINING = 9        # July .. March
 MONTHS_JUL_JAN = 7          # July .. January
 MONTHS_FEB_MAR = 2          # February, March
-
+ 
 FUTURE_MONTHS: List[str] = [
     "July", "August", "September", "October",
     "November", "December", "January", "February", "March",
@@ -45,16 +45,16 @@ FUTURE_MONTHS: List[str] = [
 MOMENTUM_MONTHS = FUTURE_MONTHS[:MONTHS_JUL_JAN]      # July .. January
 LEAKAGE_MONTHS = FUTURE_MONTHS[MONTHS_JUL_JAN:]       # February, March
 MONTH_DATES = pd.date_range("2026-07-01", periods=len(FUTURE_MONTHS), freq="MS")
-
+ 
 # --- Revenue assumptions (basis points) --------------------------------------
 REVENUE_BPS: Dict[str, float] = {"Equity": 60.0, "Debt": 20.0, "Liquid": 10.0}
 REVENUE_RATE: Dict[str, float] = {k: v / 10000.0 for k, v in REVENUE_BPS.items()}
-
+ 
 ASSETS: List[str] = ["Equity", "Debt", "Liquid"]
 SALES_TYPES: List[str] = ["GS", "NS"]
 SALES_LABEL: Dict[str, str] = {"GS": "Gross Sales", "NS": "Net Sales"}
 VERTICALS: List[str] = ["Retail", "DHNI", "VRM"]
-
+ 
 # --- Scenario assumptions -----------------------------------------------------
 S1_RUNRATE_UPLIFT = 0.20            # +20% on current run rate
 S2_EQUITY_TARGET = 1.00             # 100% of Equity FY target by January
@@ -72,9 +72,9 @@ S6_SEGMENT_TARGETS: Dict[str, float] = {
 S7_DEFAULT_JAN_TARGET = 1.00        # January milestone = 100% of FY target
 S7_DEFAULT_MAR_TARGET = 1.00        # March outcome = 100% of FY target
 S7_DEFAULT_LEAKAGE = 0.20           # Feb-Mar AUM leakage / run-rate pressure
-
+ 
 SEGMENT_ORDER: List[str] = ["Digital", "Retail B30", "Others"]
-
+ 
 # --- Scenario navigator definitions -------------------------------------------
 SCENARIOS: Dict[int, Dict[str, str]] = {
     1: {
@@ -147,20 +147,50 @@ SCENARIOS: Dict[int, Dict[str, str]] = {
         ),
         "milestone": "January 2027 milestone → Feb-Mar leakage absorbed → March 2027 target held",
     },
+    8: {
+        "label": "Scenario 8 · Channel Growth & Target Simulator",
+        "name": "Channel Growth & Target Simulator",
+        "kind": "channel_simulator",
+        "explanation": (
+            "Independently adjust monthly growth, January 2027 target achievement and March 2027 "
+            "target achievement for Digital, VRM, EM, B30, T30, T8, DHNI, Retail and Institutional."
+        ),
+        "milestone": "January 2027 target → February/March leakage → March 2027 target",
+    },
+    9: {
+        "label": "Scenario 9 · Channel Mix Optimiser",
+        "name": "Channel Mix Optimiser",
+        "kind": "channel_optimizer",
+        "explanation": (
+            "Find the minimum channel growth trajectory required to achieve a selected portfolio March "
+            "ambition, while preserving the January milestone and leakage assumption."
+        ),
+        "milestone": "Portfolio March ambition optimised across nine channels",
+    },
 }
-SCENARIO_ORDER: List[int] = [1, 2, 3, 4, 5, 6, 7]
-
+SCENARIO_ORDER: List[int] = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+ 
+# Scenario 8/9 channel planning universe.  Each channel has independent
+# momentum, January 2027 target and March 2027 target controls.
+CHANNELS: List[str] = [
+    "Digital", "VRM", "EM", "B30", "T30", "T8", "DHNI", "Retail", "Institutional"
+]
+S8_DEFAULT_GROWTH: Dict[str, float] = {c: 0.05 for c in CHANNELS}
+S8_DEFAULT_JAN_TARGET: Dict[str, float] = {c: 1.00 for c in CHANNELS}
+S8_DEFAULT_MAR_TARGET: Dict[str, float] = {c: 1.00 for c in CHANNELS}
+S8_DEFAULT_LEAKAGE = 0.20
+ 
 # --- Workbook contract --------------------------------------------------------
 SHEET_ALIASES: Dict[str, List[str]] = {
     "Retail": ["RM Retail Sales", "RM Retail", "Retail Sales"],
     "DHNI": ["RM DHNI", "DHNI", "RM D-HNI"],
     "VRM": ["VRM", "RM VRM", "VRM Sales"],
 }
-
+ 
 # Presentation/dashboard sheet. It is deliberately NOT included in
 # SHEET_ALIASES because it is not an employee-level calculation sheet.
 FINAL_SHEET_ALIASES: List[str] = ["FINAL", "Final", "Final Dashboard"]
-
+ 
 COLUMN_SPEC: Dict[Tuple[str, str], Dict[str, List[str]]] = {
     ("GS", "Equity"): {
         "fy": ["FY 26 TGT EQ"],
@@ -193,7 +223,7 @@ COLUMN_SPEC: Dict[Tuple[str, str], Dict[str, List[str]]] = {
         "ach": ["Liquid NS Ach"],
     },
 }
-
+ 
 META_ALIASES: Dict[str, List[str]] = {
     "Employee Name": ["Employee Name", "Emp Name", "Name"],
     "Emp Code": ["Emp Code", "Employee Code"],
@@ -206,7 +236,7 @@ META_ALIASES: Dict[str, List[str]] = {
     "MKT TYPE": ["MKT TYPE", "Market Type", "Mkt Type"],
 }
 META_FIELDS: List[str] = list(META_ALIASES.keys())
-
+ 
 # -----------------------------------------------------------------------------
 # SEGMENT CLASSIFICATION CONFIGURATION (Scenario 6)
 # Edit this block to change how business segments are identified. The scenario
@@ -224,36 +254,36 @@ SEGMENT_RULES: Dict[str, Dict[str, Any]] = {
     },
 }
 FALLBACK_SEGMENT = "Others"
-
-
+ 
+ 
 # =============================================================================
 # 2. GENERIC HELPERS
 # =============================================================================
-
+ 
 class WorkbookError(Exception):
     """Raised when the uploaded workbook does not satisfy the data contract."""
-
-
+ 
+ 
 def normalize_column_name(column: Any) -> str:
     """Collapse non-breaking spaces, repeated spaces and stray padding."""
     return " ".join(str(column).replace("\u00a0", " ").strip().split())
-
-
+ 
+ 
 def _norm_key(column: Any) -> str:
     return normalize_column_name(column).casefold()
-
-
+ 
+ 
 def _squash_key(column: Any) -> str:
     return "".join(ch for ch in _norm_key(column) if ch.isalnum())
-
-
+ 
+ 
 def normalize_frame(frame: pd.DataFrame) -> pd.DataFrame:
     """Return a copy of the frame with normalised column labels."""
     out = frame.copy()
     out.columns = [normalize_column_name(c) for c in out.columns]
     return out
-
-
+ 
+ 
 def clean_numeric(series: Optional[pd.Series]) -> pd.Series:
     """Coerce a column to numeric, tolerating text-formatted numbers."""
     if series is None:
@@ -269,8 +299,8 @@ def clean_numeric(series: Optional[pd.Series]) -> pd.Series:
             .replace({"": np.nan, "-": np.nan, "nan": np.nan, "NA": np.nan, "N/A": np.nan})
         )
     return pd.to_numeric(series, errors="coerce")
-
-
+ 
+ 
 def as_text(series: pd.Series) -> pd.Series:
     """Coerce any column to clean text, mapping every missing marker to ''."""
     filled = series.where(series.notna(), "")
@@ -280,15 +310,15 @@ def as_text(series: pd.Series) -> pd.Series:
         .str.strip()
         .replace({"nan": "", "NaN": "", "NaT": "", "None": "", "<NA>": ""})
     )
-
-
+ 
+ 
 def text_column(frame: pd.DataFrame, column: str) -> pd.Series:
     """Safe accessor for a metadata column that may be absent."""
     if column not in frame.columns:
         return pd.Series([""] * len(frame), index=frame.index, dtype=object)
     return as_text(frame[column])
-
-
+ 
+ 
 def safe_div(numerator: Optional[float], denominator: Optional[float]) -> Optional[float]:
     """Division that never raises and never returns inf/nan."""
     try:
@@ -302,8 +332,8 @@ def safe_div(numerator: Optional[float], denominator: Optional[float]) -> Option
         return result if np.isfinite(result) else None
     except (TypeError, ValueError):
         return None
-
-
+ 
+ 
 def _num(value: Any) -> Optional[float]:
     """Normalise a possibly-missing numeric to float or None."""
     if value is None:
@@ -313,68 +343,68 @@ def _num(value: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return f if np.isfinite(f) else None
-
-
+ 
+ 
 def _z(value: Any) -> float:
     """Numeric value with missing treated as zero (for summation)."""
     v = _num(value)
     return 0.0 if v is None else v
-
-
+ 
+ 
 def _ssum(series: pd.Series) -> Optional[float]:
     """Sum that returns None when every entry is missing."""
     total = series.sum(min_count=1)
     return _num(total)
-
-
+ 
+ 
 # --- Display formatting -------------------------------------------------------
-
+ 
 NA_TEXT = "0"
-
-
+ 
+ 
 def fmt_cr(value: Any, decimals: int = 0) -> str:
     v = _num(value)
     if v is None:
         return NA_TEXT
     return f"₹ {v:,.{decimals}f} Cr"
-
-
+ 
+ 
 def fmt_cr_signed(value: Any, decimals: int = 0) -> str:
     v = _num(value)
     if v is None:
         return NA_TEXT
     return f"₹ {v:+,.{decimals}f} Cr"
-
-
+ 
+ 
 def fmt_pct(value: Any, decimals: int = 1) -> str:
     v = _num(value)
     if v is None:
         return NA_TEXT
     return f"{v * 100:,.{decimals}f}%"
-
-
+ 
+ 
 def fmt_pct_signed(value: Any, decimals: int = 1) -> str:
     v = _num(value)
     if v is None:
         return NA_TEXT
     return f"{v * 100:+,.{decimals}f}%"
-
-
+ 
+ 
 def fmt_pts(value: Any, decimals: int = 1) -> str:
     """Percentage-point delta, e.g. +18.4 pts."""
     v = _num(value)
     if v is None:
         return NA_TEXT
     return f"{v * 100:+,.{decimals}f} pts"
-
-
+ 
+ 
 def fmt_num(value: Any, decimals: int = 0) -> str:
     v = _num(value)
     if v is None:
         return NA_TEXT
     return f"{v:,.{decimals}f}"
-
-
+ 
+ 
 FORMATTERS = {
     "cr": fmt_cr,
     "cr1": lambda v: fmt_cr(v, 1),
@@ -386,8 +416,8 @@ FORMATTERS = {
     "num": fmt_num,
     "txt": lambda v: NA_TEXT if v is None or (isinstance(v, float) and not np.isfinite(v)) else str(v),
 }
-
-
+ 
+ 
 def format_table(frame: pd.DataFrame, formats: Dict[str, str]) -> pd.DataFrame:
     """Return a display-ready copy of a numeric frame using the given formats."""
     out = pd.DataFrame(index=frame.index)
@@ -396,12 +426,12 @@ def format_table(frame: pd.DataFrame, formats: Dict[str, str]) -> pd.DataFrame:
         formatter = FORMATTERS.get(kind, FORMATTERS["txt"])
         out[column] = [formatter(v) for v in frame[column]]
     return out
-
-
+ 
+ 
 # =============================================================================
 # 3. WORKBOOK LOADING, VALIDATION & CLEANING
 # =============================================================================
-
+ 
 def _build_column_index(frame: pd.DataFrame) -> Dict[str, int]:
     """Map normalised column keys to positional index (first occurrence wins)."""
     index: Dict[str, int] = {}
@@ -410,16 +440,16 @@ def _build_column_index(frame: pd.DataFrame) -> Dict[str, int]:
             if key and key not in index:
                 index[key] = position
     return index
-
-
+ 
+ 
 def _resolve_column(index: Dict[str, int], aliases: Sequence[str]) -> Optional[int]:
     for alias in aliases:
         for key in (_norm_key(alias), _squash_key(alias)):
             if key in index:
                 return index[key]
     return None
-
-
+ 
+ 
 def _expected_header_keys() -> set:
     keys = set()
     for spec in COLUMN_SPEC.values():
@@ -430,8 +460,8 @@ def _expected_header_keys() -> set:
         for alias in aliases:
             keys.add(_norm_key(alias))
     return keys
-
-
+ 
+ 
 def _detect_header_row(raw: pd.DataFrame, max_scan: int = 15) -> int:
     """Find the row that actually holds the column headers."""
     expected = _expected_header_keys()
@@ -442,8 +472,8 @@ def _detect_header_row(raw: pd.DataFrame, max_scan: int = 15) -> int:
         if score > best_score:
             best_row, best_score = row, score
     return best_row if best_score >= 4 else 0
-
-
+ 
+ 
 def _match_sheet(available: Sequence[str], aliases: Sequence[str]) -> Optional[str]:
     normalised = {_norm_key(s): s for s in available}
     for alias in aliases:
@@ -456,8 +486,8 @@ def _match_sheet(available: Sequence[str], aliases: Sequence[str]) -> Optional[s
             if key in sheet_key:
                 return sheet
     return None
-
-
+ 
+ 
 def validate_frame(frame: pd.DataFrame, index: Dict[str, int], sheet_label: str) -> List[str]:
     """Return a list of human-readable descriptions of missing required columns."""
     missing: List[str] = []
@@ -470,30 +500,30 @@ def validate_frame(frame: pd.DataFrame, index: Dict[str, int], sheet_label: str)
                     f"(expected column '{aliases[0]}')"
                 )
     return missing
-
-
+ 
+ 
 def _extract_records(frame: pd.DataFrame, vertical: str) -> pd.DataFrame:
     """Turn one workbook sheet into a tidy per-employee record frame."""
     index = _build_column_index(frame)
     records = pd.DataFrame(index=frame.index)
     records["Vertical"] = vertical
-
+ 
     for field, aliases in META_ALIASES.items():
         position = _resolve_column(index, aliases)
         if position is None:
             records[field] = ""
         else:
             records[field] = as_text(frame.iloc[:, position]).to_numpy()
-
+ 
     for (sales, asset), spec in COLUMN_SPEC.items():
         for role, aliases in spec.items():
             position = _resolve_column(index, aliases)
             series = frame.iloc[:, position] if position is not None else None
             records[f"{sales}_{asset}_{role}"] = clean_numeric(series).to_numpy()
-
+ 
     return records
-
-
+ 
+ 
 def _clean_records(records: pd.DataFrame) -> pd.DataFrame:
     """Drop non-employee rows while preserving legitimate negative values."""
     names = text_column(records, "Employee Name").str.casefold()
@@ -503,8 +533,8 @@ def _clean_records(records: pd.DataFrame) -> pd.DataFrame:
     cleaned = records.loc[~(invalid | empty_rows)].copy()
     cleaned[numeric_columns] = cleaned[numeric_columns].fillna(0.0)
     return cleaned.reset_index(drop=True)
-
-
+ 
+ 
 @st.cache_data(show_spinner=False)
 def load_workbook(payload: bytes) -> pd.DataFrame:
     """Read, validate and clean the workbook into a single tidy record frame."""
@@ -515,14 +545,14 @@ def load_workbook(payload: bytes) -> pd.DataFrame:
             "The file could not be opened as an Excel workbook. "
             "Please upload a valid .xlsx file."
         ) from exc
-
+ 
     available = list(excel.sheet_names)
     resolved: Dict[str, str] = {}
     for vertical, aliases in SHEET_ALIASES.items():
         sheet = _match_sheet(available, aliases)
         if sheet is not None:
             resolved[vertical] = sheet
-
+ 
     missing_sheets = [v for v in SHEET_ALIASES if v not in resolved]
     if missing_sheets:
         wanted = ", ".join(f"'{SHEET_ALIASES[v][0]}'" for v in missing_sheets)
@@ -530,7 +560,7 @@ def load_workbook(payload: bytes) -> pd.DataFrame:
             f"The workbook is missing the required calculation sheet(s): {wanted}. "
             "Please upload the standard RM scorecard workbook."
         )
-
+ 
     frames: List[pd.DataFrame] = []
     problems: List[str] = []
     for vertical, sheet in resolved.items():
@@ -541,29 +571,29 @@ def load_workbook(payload: bytes) -> pd.DataFrame:
         problems.extend(validate_frame(frame, index, vertical))
         if not problems:
             frames.append(_extract_records(frame, vertical))
-
+ 
     if problems:
         raise WorkbookError(
             "The workbook is missing required columns:\n\n- " + "\n- ".join(problems[:12])
             + ("\n- …" if len(problems) > 12 else "")
         )
-
+ 
     records = _clean_records(pd.concat(frames, ignore_index=True))
     if records.empty:
         raise WorkbookError("No employee records were found in the calculation sheets.")
     return records
-
-
-
+ 
+ 
+ 
 # =============================================================================
 # 3A. FINAL SHEET — MANAGEMENT DASHBOARD VIEW
 # =============================================================================
-
+ 
 def _find_final_sheet_name(sheet_names: Sequence[str]) -> Optional[str]:
     """Resolve the sixth workbook sheet named FINAL."""
     return _match_sheet(sheet_names, FINAL_SHEET_ALIASES)
-
-
+ 
+ 
 def _excel_rgb(color: Any) -> Optional[str]:
     """Convert an openpyxl RGB colour to a CSS hex colour when possible."""
     try:
@@ -576,28 +606,28 @@ def _excel_rgb(color: Any) -> Optional[str]:
     except Exception:
         return None
     return None
-
-
+ 
+ 
 def _display_excel_value(value: Any, number_format: str = "") -> str:
     """Format Excel values for the FINAL dashboard without exposing formulas."""
     if value is None:
         return ""
-
+ 
     if isinstance(value, (pd.Timestamp,)):
         return value.strftime("%d-%b-%Y")
-
+ 
     # Date/datetime objects from openpyxl.
     if hasattr(value, "strftime") and not isinstance(value, str):
         try:
             return value.strftime("%d-%b-%Y")
         except Exception:
             pass
-
+ 
     if isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, bool):
         numeric = float(value)
         if not np.isfinite(numeric):
             return ""
-
+ 
         fmt = str(number_format or "")
         if "%" in fmt:
             # Excel stores percentages as fractions.
@@ -606,28 +636,28 @@ def _display_excel_value(value: Any, number_format: str = "") -> str:
                 decimals = len(fmt.split("%")[0].split(".")[-1].replace("0", "0"))
             decimals = min(max(decimals, 0), 2)
             return f"{numeric * 100:,.{decimals}f}%"
-
+ 
         # Respect accounting-style parentheses when possible.
         negative_parentheses = numeric < 0 and "(" in fmt and ")" in fmt
         abs_value = abs(numeric)
-
+ 
         if abs(abs_value - round(abs_value)) < 1e-9:
             rendered = f"{abs_value:,.0f}"
         else:
             rendered = f"{abs_value:,.2f}".rstrip("0").rstrip(".")
-
+ 
         if numeric < 0:
             return f"({rendered})" if negative_parentheses else f"-{rendered}"
         return rendered
-
+ 
     return str(value)
-
-
+ 
+ 
 @st.cache_data(show_spinner=False)
 def load_final_sheet_frame(payload: bytes) -> pd.DataFrame:
     """
     Read the FINAL sheet as raw cells for a fallback / inspection table.
-
+ 
     The sheet intentionally has no single header row, so header=None is used.
     """
     excel = pd.ExcelFile(io.BytesIO(payload), engine="openpyxl")
@@ -638,17 +668,17 @@ def load_final_sheet_frame(payload: bytes) -> pd.DataFrame:
             "Please upload the workbook that contains Summary, Summary-Achievement, "
             "RM Retail Sales, RM DHNI, VRM and FINAL."
         )
-
+ 
     frame = pd.read_excel(excel, sheet_name=sheet, header=None)
     frame = frame.dropna(axis=0, how="all").dropna(axis=1, how="all")
     return frame.reset_index(drop=True)
-
-
+ 
+ 
 @st.cache_data(show_spinner=False)
 def build_final_sheet_html(payload: bytes) -> str:
     """
     Render the Excel FINAL sheet into a scrollable HTML table.
-
+ 
     This keeps merged headings and the workbook's basic font/fill/alignment
     styling, while using cached formula results (data_only=True).
     """
@@ -659,9 +689,9 @@ def build_final_sheet_html(payload: bytes) -> str:
             "The workbook does not contain the sixth sheet 'FINAL'. "
             "Please upload the workbook that contains the FINAL dashboard sheet."
         )
-
+ 
     ws = workbook[sheet_name]
-
+ 
     # Find the real content boundary from non-empty values rather than Excel's
     # formatted used-range, which can extend thousands of blank rows/columns.
     non_empty = [
@@ -672,12 +702,12 @@ def build_final_sheet_html(payload: bytes) -> str:
     ]
     if not non_empty:
         return "<div class='note'>The FINAL sheet is empty.</div>"
-
+ 
     min_row = min(r for r, _ in non_empty)
     max_row = max(r for r, _ in non_empty)
     min_col = min(c for _, c in non_empty)
     max_col = max(c for _, c in non_empty)
-
+ 
     # Merged-cell lookup.
     merge_anchor: Dict[Tuple[int, int], Tuple[int, int]] = {}
     merge_covered: set = set()
@@ -697,7 +727,7 @@ def build_final_sheet_html(payload: bytes) -> str:
             for cc in range(merged.min_col, merged.max_col + 1):
                 if (rr, cc) != anchor:
                     merge_covered.add((rr, cc))
-
+ 
     html_parts = [
         """
         <div style="
@@ -719,13 +749,13 @@ def build_final_sheet_html(payload: bytes) -> str:
         ">
         """
     ]
-
+ 
     for row_idx in range(min_row, max_row + 1):
         row_values = [
             ws.cell(row=row_idx, column=col_idx).value
             for col_idx in range(min_col, max_col + 1)
         ]
-
+ 
         # Keep dashboard spacing, but collapse very large blank areas to a
         # single slim spacer row.
         if all(v in (None, "") for v in row_values):
@@ -734,19 +764,19 @@ def build_final_sheet_html(payload: bytes) -> str:
                 .format(max_col - min_col + 1)
             )
             continue
-
+ 
         html_parts.append("<tr>")
         for col_idx in range(min_col, max_col + 1):
             if (row_idx, col_idx) in merge_covered:
                 continue
-
+ 
             cell = ws.cell(row=row_idx, column=col_idx)
             rowspan, colspan = merge_anchor.get((row_idx, col_idx), (1, 1))
-
+ 
             value = _display_excel_value(cell.value, cell.number_format)
             font_color = _excel_rgb(cell.font.color)
             fill_color = _excel_rgb(cell.fill.fgColor)
-
+ 
             styles = [
                 "border:1px solid #E4D4AA",
                 "padding:5px 7px",
@@ -755,7 +785,7 @@ def build_final_sheet_html(payload: bytes) -> str:
                 "vertical-align:middle",
                 "background:#FFFDF7",
             ]
-
+ 
             if fill_color and fill_color.lower() not in {"#000000", "#ffffff"}:
                 styles.append(f"background:{fill_color}")
             if font_color:
@@ -764,7 +794,7 @@ def build_final_sheet_html(payload: bytes) -> str:
                 styles.append("font-weight:700")
             if cell.font.italic:
                 styles.append("font-style:italic")
-
+ 
             horizontal = getattr(cell.alignment, "horizontal", None)
             if horizontal in {"center", "centerContinuous"}:
                 styles.append("text-align:center")
@@ -772,35 +802,35 @@ def build_final_sheet_html(payload: bytes) -> str:
                 styles.append("text-align:right")
             else:
                 styles.append("text-align:left")
-
+ 
             attrs = []
             if rowspan > 1:
                 attrs.append(f"rowspan='{rowspan}'")
             if colspan > 1:
                 attrs.append(f"colspan='{colspan}'")
-
+ 
             html_parts.append(
                 f"<td {' '.join(attrs)} style=\"{';'.join(styles)}\">"
                 f"{escape(value)}"
                 "</td>"
             )
         html_parts.append("</tr>")
-
+ 
     html_parts.append("</table></div>")
     return "".join(html_parts)
-
-
+ 
+ 
 FINAL_METRIC_ROWS: List[str] = [
     "Overall", "Equity", "Debt", "Liquid",
     "Retail", "DHNI", "VRM", "Insti", "Digital",
     "Alternatives", "Passives",
 ]
-
-
+ 
+ 
 def _final_key(value: Any) -> str:
     return " ".join(str(value or "").replace("\u00a0", " ").strip().split()).lower()
-
-
+ 
+ 
 def _final_number(value: Any) -> Optional[float]:
     """Convert FINAL-sheet numeric / accounting text into float."""
     if value is None:
@@ -808,11 +838,11 @@ def _final_number(value: Any) -> Optional[float]:
     if isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, bool):
         numeric = float(value)
         return numeric if np.isfinite(numeric) else None
-
+ 
     raw = str(value).strip()
     if not raw or raw.lower() in {"-", "—", "na", "n/a", "none", "nan", "#div/0!"}:
         return None
-
+ 
     negative = raw.startswith("(") and raw.endswith(")")
     cleaned = (
         raw.replace(",", "")
@@ -829,8 +859,8 @@ def _final_number(value: Any) -> Optional[float]:
     if negative:
         numeric = -numeric
     return numeric
-
-
+ 
+ 
 def _final_known_label(value: Any) -> Optional[str]:
     key = _final_key(value)
     aliases = {
@@ -850,13 +880,13 @@ def _final_known_label(value: Any) -> Optional[str]:
         "passive": "Passives",
     }
     return aliases.get(key)
-
-
+ 
+ 
 def _scan_final_sheet(ws: Any) -> Tuple[int, int]:
     """Cap the scan to the management-dashboard area, not formatted blank Excel space."""
     return min(max(ws.max_row, 1), 320), min(max(ws.max_column, 1), 180)
-
-
+ 
+ 
 def _find_final_cells(ws: Any, wanted: str) -> List[Tuple[int, int]]:
     wanted_key = _final_key(wanted)
     max_row, max_col = _scan_final_sheet(ws)
@@ -866,8 +896,8 @@ def _find_final_cells(ws: Any, wanted: str) -> List[Tuple[int, int]]:
             if _final_key(ws.cell(row=row, column=col).value) == wanted_key:
                 found.append((row, col))
     return found
-
-
+ 
+ 
 def _find_header_near(
     ws: Any,
     title_position: Tuple[int, int],
@@ -886,29 +916,29 @@ def _find_header_near(
             if _final_key(ws.cell(row=row, column=col).value) == wanted:
                 return row, col
     return None
-
-
+ 
+ 
 def _augment_final_runrate(frame: pd.DataFrame, months_done: int) -> pd.DataFrame:
     """Recreate the run-rate formulas shown in FINAL from Target and YTD."""
     if frame.empty:
         return frame
-
+ 
     months = max(int(months_done), 1)
     out = frame.copy()
     out["FY27 Target"] = pd.to_numeric(out["FY27 Target"], errors="coerce")
     out["YTD"] = pd.to_numeric(out["YTD"], errors="coerce")
-
+ 
     out["Achievement %"] = np.where(
         (out["FY27 Target"] > 0) & (out["YTD"] >= 0),
         out["YTD"] / out["FY27 Target"],
         np.nan,
     )
     out["Current RR"] = out["YTD"] / months
-
+ 
     # This matches the FINAL workbook screenshot:
     # 154,757 / 12 = 12,896; 20,699 / 12 = 1,725.
     out["Required RR to Target"] = out["FY27 Target"] / 12.0
-
+ 
     # Annualise the current Apr-Jun run rate to a full 12-month FY.
     out["Estimated FY @ Current RR"] = out["Current RR"] * 12.0
     out["Projected FY %"] = np.where(
@@ -917,8 +947,8 @@ def _augment_final_runrate(frame: pd.DataFrame, months_done: int) -> pd.DataFram
         np.nan,
     )
     return out
-
-
+ 
+ 
 def _parse_final_sales_block(ws: Any, title: str, months_done: int) -> pd.DataFrame:
     """Parse the NET SALES / GROSS SALES run-rate block on the FINAL sheet."""
     positions = _find_final_cells(ws, title)
@@ -926,51 +956,51 @@ def _parse_final_sales_block(ws: Any, title: str, months_done: int) -> pd.DataFr
         header = _find_header_near(ws, position, "FY27 Target")
         if header is None:
             continue
-
+ 
         header_row, target_col = header
-
+ 
         # In the FINAL block the row label sits immediately to the left of FY27 Target.
         label_col = max(1, target_col - 1)
         ytd_col = target_col + 1
-
+ 
         rows: List[Dict[str, Any]] = []
         seen: set = set()
         max_row, _ = _scan_final_sheet(ws)
-
+ 
         for row in range(header_row + 1, min(header_row + 28, max_row) + 1):
             label = _final_known_label(ws.cell(row=row, column=label_col).value)
             if label is None or label in seen:
                 continue
-
+ 
             target = _final_number(ws.cell(row=row, column=target_col).value)
             ytd = _final_number(ws.cell(row=row, column=ytd_col).value)
-
+ 
             # Ignore title/spacer rows accidentally matching a label.
             if target is None and ytd is None:
                 continue
-
+ 
             rows.append({"Metric": label, "FY27 Target": target, "YTD": ytd})
             seen.add(label)
-
+ 
         if rows:
             frame = pd.DataFrame(rows).set_index("Metric")
             order = [label for label in FINAL_METRIC_ROWS if label in frame.index]
             return _augment_final_runrate(frame.loc[order].reset_index(), months_done).set_index("Metric")
-
+ 
     return pd.DataFrame()
-
-
+ 
+ 
 def _parse_final_aum_block(ws: Any) -> pd.DataFrame:
     """Parse Target / Current AUM from the FINAL management sheet."""
     positions = _find_final_cells(ws, "AUM")
     for position in positions:
         title_row, title_col = position
         max_row, max_col = _scan_final_sheet(ws)
-
+ 
         header_row = None
         target_col = None
         current_col = None
-
+ 
         for row in range(title_row, min(title_row + 6, max_row) + 1):
             for col in range(max(1, title_col - 4), min(max_col, title_col + 8) + 1):
                 if _final_key(ws.cell(row=row, column=col).value) == "target":
@@ -985,14 +1015,14 @@ def _parse_final_aum_block(ws: Any) -> pd.DataFrame:
                     break
             if header_row is not None:
                 break
-
+ 
         if header_row is None or target_col is None or current_col is None:
             continue
-
+ 
         label_col = max(1, target_col - 1)
         rows: List[Dict[str, Any]] = []
         seen: set = set()
-
+ 
         for row in range(header_row + 1, min(header_row + 28, max_row) + 1):
             label = _final_known_label(ws.cell(row=row, column=label_col).value)
             if label is None or label in seen:
@@ -1003,7 +1033,7 @@ def _parse_final_aum_block(ws: Any) -> pd.DataFrame:
                 continue
             rows.append({"Metric": label, "Target": target, "Current": current})
             seen.add(label)
-
+ 
         if rows:
             frame = pd.DataFrame(rows).set_index("Metric")
             order = [label for label in FINAL_METRIC_ROWS if label in frame.index]
@@ -1015,10 +1045,10 @@ def _parse_final_aum_block(ws: Any) -> pd.DataFrame:
             )
             frame["Gap to Target"] = frame["Target"] - frame["Current"]
             return frame
-
+ 
     return pd.DataFrame()
-
-
+ 
+ 
 def _parse_months_done(ws: Any) -> int:
     positions = (
         _find_final_cells(ws, "#months done")
@@ -1026,7 +1056,7 @@ def _parse_months_done(ws: Any) -> int:
         + _find_final_cells(ws, "# months done")
     )
     max_row, max_col = _scan_final_sheet(ws)
-
+ 
     for row, col in positions:
         # Search immediately around / below the label for the red "3".
         for rr in range(row, min(row + 4, max_row) + 1):
@@ -1035,8 +1065,8 @@ def _parse_months_done(ws: Any) -> int:
                 if value is not None and 1 <= value <= 12:
                     return int(round(value))
     return MONTHS_COMPLETED
-
-
+ 
+ 
 @st.cache_data(show_spinner=False)
 def parse_final_dashboard_metrics(payload: bytes) -> Dict[str, Any]:
     """Return structured management metrics from the workbook's FINAL sheet."""
@@ -1047,14 +1077,14 @@ def parse_final_dashboard_metrics(payload: bytes) -> Dict[str, Any]:
             "The workbook is missing the required sixth sheet 'FINAL'. "
             "Please upload the workbook containing FINAL."
         )
-
+ 
     ws = workbook[sheet_name]
     months_done = _parse_months_done(ws)
-
+ 
     gs = _parse_final_sales_block(ws, "GROSS SALES", months_done)
     ns = _parse_final_sales_block(ws, "NET SALES", months_done)
     aum = _parse_final_aum_block(ws)
-
+ 
     return {
         "sheet_name": sheet_name,
         "months_done": months_done,
@@ -1062,8 +1092,8 @@ def parse_final_dashboard_metrics(payload: bytes) -> Dict[str, Any]:
         "NS": ns,
         "AUM": aum,
     }
-
-
+ 
+ 
 def _model_metric_baseline(model: "ScenarioModel", sales: str, label: str) -> Dict[str, Any]:
     if label == "Overall":
         return model.baseline(sales)
@@ -1072,8 +1102,8 @@ def _model_metric_baseline(model: "ScenarioModel", sales: str, label: str) -> Di
     if label in VERTICALS:
         return model.baseline(sales, vertical=label)
     return {}
-
-
+ 
+ 
 def _model_metric_cell(model: "ScenarioModel", sales: str, label: str) -> Optional[Dict[str, Any]]:
     if label == "Overall":
         return model.cell(sales)
@@ -1082,8 +1112,8 @@ def _model_metric_cell(model: "ScenarioModel", sales: str, label: str) -> Option
     if label in VERTICALS:
         return model.cell(sales, vertical=label)
     return None
-
-
+ 
+ 
 def final_sales_metrics(
     final_metrics: Dict[str, Any],
     model: "ScenarioModel",
@@ -1099,10 +1129,10 @@ def final_sales_metrics(
         frame = parsed.copy()
     else:
         frame = pd.DataFrame()
-
+ 
     months_done = int(final_metrics.get("months_done", MONTHS_COMPLETED))
     needed = ["Overall", *ASSETS, *VERTICALS]
-
+ 
     fallback_rows: List[Dict[str, Any]] = []
     for label in needed:
         if not frame.empty and label in frame.index:
@@ -1117,23 +1147,23 @@ def final_sales_metrics(
                 "YTD": base.get("ytd_ach"),
             }
         )
-
+ 
     if fallback_rows:
         fallback = _augment_final_runrate(pd.DataFrame(fallback_rows), months_done).set_index("Metric")
         if frame.empty:
             frame = fallback
         else:
             frame = pd.concat([frame, fallback], axis=0)
-
+ 
     if frame.empty:
         return frame
-
+ 
     # Preserve management ordering and avoid accidental duplicate rows.
     frame = frame.loc[~frame.index.duplicated(keep="first")].copy()
     order = [label for label in FINAL_METRIC_ROWS if label in frame.index]
     return frame.loc[order]
-
-
+ 
+ 
 def build_final_scenario_comparison(
     final_metrics: Dict[str, Any],
     model: "ScenarioModel",
@@ -1142,26 +1172,26 @@ def build_final_scenario_comparison(
     """Scenario comparison expressed on the same Target/YTD/run-rate metrics as FINAL."""
     current = final_sales_metrics(final_metrics, model, sales)
     rows: List[Dict[str, Any]] = []
-
+ 
     for label in current.index.tolist():
         source = current.loc[label]
         cell = _model_metric_cell(model, sales, label)
-
+ 
         final_target = _num(source.get("FY27 Target"))
         current_rr = _num(source.get("Current RR"))
         current_projection = _num(source.get("Estimated FY @ Current RR"))
         current_pct = _num(source.get("Projected FY %"))
-
+ 
         model_base = _model_metric_baseline(model, sales, label)
         model_target = _num(model_base.get("fy_target")) if model_base else None
-
+ 
         scenario_pct = _num(cell.get("march_pct")) if cell is not None else None
-
+ 
         scenario_amount = None
         scenario_rr = None
         rr_change = None
         delta_pp = None
-
+ 
         if cell is not None:
             # Anchor the scenario outcome to the FINAL FY27 target so the
             # management comparison uses one common metric base.
@@ -1170,7 +1200,7 @@ def build_final_scenario_comparison(
                 if final_target is not None and scenario_pct is not None
                 else _num(cell.get("march_amount"))
             )
-
+ 
             scenario_rr = _num(cell.get("scen_rr"))
             if (
                 scenario_rr is not None
@@ -1179,13 +1209,13 @@ def build_final_scenario_comparison(
                 and model_target != 0
             ):
                 scenario_rr = scenario_rr * final_target / model_target
-
+ 
             if current_rr is not None and scenario_rr is not None and current_rr != 0:
                 rr_change = scenario_rr / current_rr - 1.0
-
+ 
             if current_pct is not None and scenario_pct is not None:
                 delta_pp = scenario_pct - current_pct
-
+ 
         rows.append(
             {
                 "Metric": label,
@@ -1202,7 +1232,7 @@ def build_final_scenario_comparison(
                 "Scenario Δ pp": delta_pp,
             }
         )
-
+ 
     formats = {
         "Metric": "txt",
         "FY27 Target": "cr",
@@ -1218,14 +1248,14 @@ def build_final_scenario_comparison(
         "Scenario Δ pp": "pts",
     }
     return pd.DataFrame(rows), formats
-
-
+ 
+ 
 FINAL_ASSET_ROWS: List[str] = ["Equity", "Debt", "Liquid"]
 FINAL_CHANNEL_ROWS: List[str] = [
     "Retail", "DHNI", "VRM", "Insti", "Digital", "Alternatives", "Passives",
 ]
-
-
+ 
+ 
 def _render_metric_bifurcation(
     frame: pd.DataFrame,
     formats: Dict[str, str],
@@ -1241,15 +1271,15 @@ def _render_metric_bifurcation(
     if frame is None or frame.empty or metric_column not in frame.columns:
         st.info("No metrics are available for this view.")
         return
-
+ 
     work = frame.copy()
-
+ 
     overall = work.loc[work[metric_column] == "Overall"].copy()
     assets = work.loc[work[metric_column].isin(FINAL_ASSET_ROWS)].copy()
     channels = work.loc[
         ~work[metric_column].isin(["Overall", *FINAL_ASSET_ROWS])
     ].copy()
-
+ 
     if not overall.empty:
         st.markdown("<div class='subsection-title'>Overall</div>", unsafe_allow_html=True)
         overall = overall.rename(columns={metric_column: "Scope"})
@@ -1258,7 +1288,7 @@ def _render_metric_bifurcation(
         overall_formats.pop(metric_column, None)
         overall_formats["Scope"] = "txt"
         show_table(overall, overall_formats)
-
+ 
     if not assets.empty:
         st.markdown("<div class='subsection-title'>Asset Class</div>", unsafe_allow_html=True)
         assets = assets.rename(columns={metric_column: "Asset Class"})
@@ -1266,7 +1296,7 @@ def _render_metric_bifurcation(
         asset_formats.pop(metric_column, None)
         asset_formats["Asset Class"] = "txt"
         show_table(assets, asset_formats)
-
+ 
     if not channels.empty:
         st.markdown("<div class='subsection-title'>Channel</div>", unsafe_allow_html=True)
         channels = channels.rename(columns={metric_column: "Channel"})
@@ -1274,15 +1304,15 @@ def _render_metric_bifurcation(
         channel_formats.pop(metric_column, None)
         channel_formats["Channel"] = "txt"
         show_table(channels, channel_formats)
-
-
+ 
+ 
 def render_current_runrate_metric_grid(
     final_metrics: Dict[str, Any],
     model: "ScenarioModel",
 ) -> None:
     """Current FINAL run-rate grid, shown after current-vs-scenario comparison."""
     section("Current Run-Rate Metric Grid")
-
+ 
     display_cols = [
         "FY27 Target",
         "YTD",
@@ -1302,7 +1332,7 @@ def render_current_runrate_metric_grid(
         "Estimated FY @ Current RR": "cr",
         "Projected FY %": "pct",
     }
-
+ 
     tabs = st.tabs(["Gross Sales", "Net Sales"])
     for tab, sales in zip(tabs, SALES_TYPES):
         with tab:
@@ -1310,31 +1340,31 @@ def render_current_runrate_metric_grid(
             if frame.empty:
                 st.info(f"{SALES_LABEL[sales]} metrics could not be located in FINAL.")
                 continue
-
+ 
             display = frame.reset_index()[["Metric", *display_cols]]
             _render_metric_bifurcation(display, formats)
-
-
+ 
+ 
 def render_final_metric_baseline(
     final_metrics: Dict[str, Any],
     model: "ScenarioModel",
 ) -> None:
     """Headline management metrics sourced from FINAL."""
     section("Current Performance Metrics · FINAL")
-
+ 
     gs = final_sales_metrics(final_metrics, model, "GS")
     ns = final_sales_metrics(final_metrics, model, "NS")
-
+ 
     def overall(frame: pd.DataFrame) -> pd.Series:
         return (
             frame.loc["Overall"]
             if not frame.empty and "Overall" in frame.index
             else pd.Series(dtype=float)
         )
-
+ 
     gs_o = overall(gs)
     ns_o = overall(ns)
-
+ 
     kpi_row([
         ("GS FY27 Target", fmt_cr(gs_o.get("FY27 Target")), "FINAL", "off"),
         ("GS YTD", fmt_cr(gs_o.get("YTD")),
@@ -1346,7 +1376,7 @@ def render_final_metric_baseline(
          None if _num(gs_o.get("Projected FY %")) is None
          else fmt_pts(gs_o.get("Projected FY %") - 1.0)),
     ])
-
+ 
     kpi_row([
         ("NS FY27 Target", fmt_cr(ns_o.get("FY27 Target")), "FINAL", "off"),
         ("NS YTD", fmt_cr(ns_o.get("YTD")),
@@ -1358,15 +1388,15 @@ def render_final_metric_baseline(
          None if _num(ns_o.get("Projected FY %")) is None
          else fmt_pts(ns_o.get("Projected FY %") - 1.0)),
     ])
-
+ 
     st.markdown(
         "<div class='note'>Headline performance is sourced from the workbook's "
         "<b>FINAL</b> sheet. Current RR shows the observed YTD pace; Required RR "
         "shows the monthly pace implied by the full-year target.</div>",
         unsafe_allow_html=True,
     )
-
-
+ 
+ 
 def render_final_scenario_comparison(
     final_metrics: Dict[str, Any],
     model: "ScenarioModel",
@@ -1374,19 +1404,19 @@ def render_final_scenario_comparison(
 ) -> None:
     """Selected scenario compared with the same FINAL metrics used in the baseline."""
     section(f"Current Metrics vs Scenario {model.scenario_id} · {model.meta['name']}")
-
+ 
     gs_frame, gs_formats = build_final_scenario_comparison(final_metrics, model, "GS")
     ns_frame, ns_formats = build_final_scenario_comparison(final_metrics, model, "NS")
-
+ 
     def overall_row(frame: pd.DataFrame) -> pd.Series:
         if frame.empty:
             return pd.Series(dtype=float)
         match = frame.loc[frame["Metric"] == "Overall"]
         return match.iloc[0] if not match.empty else pd.Series(dtype=float)
-
+ 
     gs_o = overall_row(gs_frame)
     ns_o = overall_row(ns_frame)
-
+ 
     kpi_row([
         ("GS Current Projection", fmt_pct(gs_o.get("Current Projected %")),
          fmt_cr(gs_o.get("Current FY Estimate")), "off"),
@@ -1398,7 +1428,7 @@ def render_final_scenario_comparison(
          fmt_pct_signed(gs_o.get("Run Rate Change %"))
          if _num(gs_o.get("Run Rate Change %")) is not None else None),
     ])
-
+ 
     kpi_row([
         ("NS Current Projection", fmt_pct(ns_o.get("Current Projected %")),
          fmt_cr(ns_o.get("Current FY Estimate")), "off"),
@@ -1410,19 +1440,19 @@ def render_final_scenario_comparison(
          fmt_pct_signed(ns_o.get("Run Rate Change %"))
          if _num(ns_o.get("Run Rate Change %")) is not None else None),
     ])
-
+ 
     st.markdown(
         f"<div class='scenario-highlight'><b>Scenario {model.scenario_id} · "
         f"{model.meta['name']}</b><br>{model.meta['explanation']}</div>",
         unsafe_allow_html=True,
     )
-
+ 
     tabs = st.tabs(["Gross Sales · Current vs Scenario", "Net Sales · Current vs Scenario"])
     with tabs[0]:
         _render_metric_bifurcation(gs_frame, gs_formats)
     with tabs[1]:
         _render_metric_bifurcation(ns_frame, ns_formats)
-
+ 
     st.markdown(
         "<div class='note'>Overall and Asset Class are shown separately from Channel. "
         "Retail, DHNI and VRM have scenario calculations from their detailed sheets. "
@@ -1430,8 +1460,8 @@ def render_final_scenario_comparison(
         "scenario fields stay blank where no detailed calculation sheet exists.</div>",
         unsafe_allow_html=True,
     )
-
-
+ 
+ 
 def render_final_dashboard(payload: bytes) -> None:
     """Display the workbook's sixth FINAL sheet inside the Streamlit app."""
     st.markdown(
@@ -1444,27 +1474,27 @@ def render_final_dashboard(payload: bytes) -> None:
         unsafe_allow_html=True,
     )
     st.markdown("<div class='app-rule'></div>", unsafe_allow_html=True)
-
+ 
     try:
         html = build_final_sheet_html(payload)
     except WorkbookError as error:
         st.error(str(error))
         return
-
+ 
     st.markdown(
         "<div class='note'>This view is taken from the Excel <b>FINAL</b> sheet. "
         "Use the horizontal scroll inside the dashboard to see all columns.</div>",
         unsafe_allow_html=True,
     )
     st.markdown(html, unsafe_allow_html=True)
-
+ 
     with st.expander("View FINAL sheet as raw data", expanded=False):
         try:
             raw = load_final_sheet_frame(payload)
             st.dataframe(raw, use_container_width=True, hide_index=True, height=620)
         except WorkbookError as error:
             st.error(str(error))
-
+ 
     st.download_button(
         "Download uploaded workbook",
         data=payload,
@@ -1472,12 +1502,12 @@ def render_final_dashboard(payload: bytes) -> None:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=False,
     )
-
-
+ 
+ 
 # =============================================================================
 # 4. SEGMENT IDENTIFICATION (Scenario 6)
 # =============================================================================
-
+ 
 def identify_segments(records: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
     """Suggest a column + values that identify each configured business segment."""
     suggestions: Dict[str, Dict[str, Any]] = {}
@@ -1494,8 +1524,8 @@ def identify_segments(records: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
                 suggestions[segment] = {"column": column, "values": matches}
                 break
     return suggestions
-
-
+ 
+ 
 def map_business_segments(
     records: pd.DataFrame,
     mapping: Dict[str, Dict[str, Any]],
@@ -1514,27 +1544,89 @@ def map_business_segments(
         mask = text_column(out, column).isin(values)
         out.loc[mask, "Segment"] = segment
     return out
-
-
+ 
+ 
 def segment_diagnostics(records: pd.DataFrame) -> Dict[str, int]:
     counts = records["Segment"].value_counts().to_dict()
     return {segment: int(counts.get(segment, 0)) for segment in SEGMENT_ORDER}
-
-
+ 
+ 
+CHANNEL_KEYWORDS: Dict[str, List[str]] = {
+    "Digital": ["digital", "online", "d2c", "e-com", "ecom", "virtual", "web"],
+    "VRM": ["vrm", "virtual relationship", "virtual rm"],
+    "EM": ["em", "emerging market", "em city"],
+    "B30": ["b30", "b-30", "b 30"],
+    "T30": ["t30", "t-30", "t 30"],
+    "T8": ["t8", "t-8", "t 8"],
+    "DHNI": ["dhni", "d-hni", "hni", "wealth"],
+    "Retail": ["retail", "rm retail"],
+    "Institutional": ["insti", "institutional", "institution", "institutional sales"],
+}
+ 
+def _channel_text_score(row: pd.Series, channel: str) -> int:
+    values = " ".join(str(row.get(c, "")) for c in META_FIELDS).casefold()
+    return sum(1 for keyword in CHANNEL_KEYWORDS[channel] if keyword in values)
+ 
+def identify_channels(records: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+    """Suggest channel mappings from workbook metadata without hard-coding one schema."""
+    suggestions: Dict[str, Dict[str, Any]] = {}
+    usable = [f for f in META_FIELDS if f in records.columns and text_column(records, f).ne("").any()]
+    for channel in CHANNELS:
+        best = (0, None, [])
+        for column in usable:
+            values = sorted({v for v in text_column(records, column) if v.strip()})
+            matches = [v for v in values if any(k in v.casefold() for k in CHANNEL_KEYWORDS[channel])]
+            score = len(matches)
+            if score > best[0]:
+                best = (score, column, matches)
+        if best[1] and best[2]:
+            suggestions[channel] = {"column": best[1], "values": best[2]}
+        elif channel == "VRM" and "Vertical" in records.columns:
+            suggestions[channel] = {"column": "Vertical", "values": ["VRM"]}
+        elif channel == "DHNI" and "Vertical" in records.columns:
+            suggestions[channel] = {"column": "Vertical", "values": ["DHNI"]}
+        elif channel == "Retail" and "Vertical" in records.columns:
+            suggestions[channel] = {"column": "Vertical", "values": ["Retail"]}
+    return suggestions
+ 
+ 
+def map_business_channels(records: pd.DataFrame, mapping: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
+    """Assign every record to one of the nine Scenario 8 planning channels."""
+    out = records.copy()
+    out["Channel"] = "Unclassified"
+    # More specific channels are applied first; explicit mapping wins.
+    for channel in CHANNELS:
+        rule = mapping.get(channel)
+        if not rule:
+            continue
+        column, values = rule.get("column"), set(rule.get("values") or [])
+        if not column or column not in out.columns or not values:
+            continue
+        mask = text_column(out, column).isin(values)
+        out.loc[mask, "Channel"] = channel
+    # Use the existing vertical as a safe fallback for the three explicit RM populations.
+    if "Vertical" in out.columns:
+        for channel, vertical in (("VRM", "VRM"), ("DHNI", "DHNI"), ("Retail", "Retail")):
+            mask = (out["Channel"] == "Unclassified") & (out["Vertical"] == vertical)
+            out.loc[mask, "Channel"] = channel
+    return out
+ 
+ 
 # =============================================================================
 # 5. BASE GRID & CURRENT-STATE STATISTICS
 # =============================================================================
-
+ 
 def build_base_grid(records: pd.DataFrame) -> pd.DataFrame:
     """Aggregate records to the finest analytical grain used by the engine."""
     rows: List[Dict[str, Any]] = []
-    grouped = records.groupby(["Vertical", "Segment"], dropna=False)
-    for (vertical, segment), block in grouped:
+    grouped = records.groupby(["Vertical", "Segment", "Channel"], dropna=False)
+    for (vertical, segment, channel), block in grouped:
         for sales in SALES_TYPES:
             for asset in ASSETS:
                 rows.append({
                     "Vertical": vertical,
                     "Segment": segment,
+                    "Channel": channel,
                     "Sales": sales,
                     "Asset": asset,
                     "fy_target": float(block[f"{sales}_{asset}_fy"].sum()),
@@ -1542,14 +1634,15 @@ def build_base_grid(records: pd.DataFrame) -> pd.DataFrame:
                     "ytd_ach": float(block[f"{sales}_{asset}_ach"].sum()),
                 })
     return pd.DataFrame(rows)
-
-
+ 
+ 
 def filter_grid(
     grid: pd.DataFrame,
     sales: Optional[str] = None,
     asset: Optional[str] = None,
     vertical: Optional[str] = None,
     segment: Optional[str] = None,
+    channel: Optional[str] = None,
 ) -> pd.DataFrame:
     mask = pd.Series(True, index=grid.index)
     if sales is not None:
@@ -1560,9 +1653,11 @@ def filter_grid(
         mask &= grid["Vertical"] == vertical
     if segment is not None:
         mask &= grid["Segment"] == segment
+    if channel is not None and "Channel" in grid.columns:
+        mask &= grid["Channel"] == channel
     return grid.loc[mask]
-
-
+ 
+ 
 def current_asset_stats(fy_target: float, ytd_target: float, ytd_ach: float) -> Dict[str, Any]:
     """Baseline statistics for one asset / group. Never scenario dependent."""
     fy_target = _z(fy_target)
@@ -1580,8 +1675,8 @@ def current_asset_stats(fy_target: float, ytd_target: float, ytd_ach: float) -> 
         "current_march": current_march,
         "current_march_pct": safe_div(current_march, fy_target),
     }
-
-
+ 
+ 
 def summarize_current(grid: pd.DataFrame, **filters: Any) -> Dict[str, Any]:
     """Baseline statistics for an arbitrary slice of the base grid."""
     subset = filter_grid(grid, **filters)
@@ -1590,12 +1685,12 @@ def summarize_current(grid: pd.DataFrame, **filters: Any) -> Dict[str, Any]:
         subset["ytd_target"].sum(),
         subset["ytd_ach"].sum(),
     )
-
-
+ 
+ 
 # =============================================================================
 # 6. SCENARIO ENGINE - SCENARIOS 1 TO 6
 # =============================================================================
-
+ 
 def _blank_cell(stats: Dict[str, Any]) -> Dict[str, Any]:
     cell = dict(stats)
     cell.update({
@@ -1609,8 +1704,8 @@ def _blank_cell(stats: Dict[str, Any]) -> Dict[str, Any]:
         "trajectory": None, "note": "",
     })
     return cell
-
-
+ 
+ 
 def compute_cell(
     fy_target: float,
     ytd_target: float,
@@ -1625,7 +1720,7 @@ def compute_cell(
     cell = _blank_cell(stats)
     ach = stats["ytd_ach"]
     current_rr = stats["current_rr"] or 0.0
-
+ 
     if kind == "runrate":
         scen_rr = current_rr * (1.0 + (uplift or 0.0))
         jan_amount = ach + scen_rr * MONTHS_JUL_JAN
@@ -1636,7 +1731,7 @@ def compute_cell(
             "march_amount": ach + scen_rr * MONTHS_REMAINING,
             "milestone_pct": None,
         })
-
+ 
     elif kind == "jan_target":
         required = max(_z(multiplier) * stats["fy_target"], ach)
         scen_rr = max(required - ach, 0.0) / MONTHS_JUL_JAN
@@ -1650,7 +1745,7 @@ def compute_cell(
             "march_amount": jan_amount + feb_mar_rr * MONTHS_FEB_MAR,
             "milestone_pct": multiplier,
         })
-
+ 
     elif kind == "march_target":
         required = max(_z(multiplier) * stats["fy_target"], ach)
         scen_rr = max(required - ach, 0.0) / MONTHS_REMAINING
@@ -1662,41 +1757,41 @@ def compute_cell(
             "march_amount": ach + scen_rr * MONTHS_REMAINING,
             "milestone_pct": multiplier,
         })
-
+ 
     else:  # pragma: no cover - guarded by the scenario registry
         raise ValueError(f"Unknown scenario kind: {kind}")
-
+ 
     return _finalise_cell(cell)
-
-
+ 
+ 
 def _finalise_cell(cell: Dict[str, Any]) -> Dict[str, Any]:
     """Recompute all derived ratios from the absolute amounts in the cell."""
     fy_target = cell.get("fy_target")
     current_rr = _num(cell.get("current_rr"))
     scen_rr = _num(cell.get("scen_rr"))
-
+ 
     cell["ytd_ach_pct"] = safe_div(cell.get("ytd_ach"), cell.get("ytd_target"))
     cell["fy_completed_pct"] = safe_div(cell.get("ytd_ach"), fy_target)
     cell["current_march_pct"] = safe_div(cell.get("current_march"), fy_target)
     cell["jan_pct"] = safe_div(cell.get("jan_amount"), fy_target)
     cell["march_pct"] = safe_div(cell.get("march_amount"), fy_target)
-
+ 
     if current_rr is not None and current_rr > 0 and scen_rr is not None:
         cell["rr_change_pct"] = (scen_rr / current_rr) - 1.0
     else:
         cell["rr_change_pct"] = None
-
+ 
     march_amount = _num(cell.get("march_amount"))
     current_march = _num(cell.get("current_march"))
     if march_amount is not None and current_march is not None:
         cell["incremental_sales"] = march_amount - current_march
-
+ 
     jan_required = _num(cell.get("jan_required"))
     jan_amount = _num(cell.get("jan_amount"))
     if jan_required is not None and jan_amount is not None:
         cell["jan_buffer"] = jan_amount - jan_required
         cell["jan_buffer_pct"] = safe_div(cell["jan_buffer"], jan_required)
-
+ 
     march_required = _num(cell.get("march_required"))
     if march_required is not None and march_amount is not None:
         cell["headroom_amt"] = march_amount - march_required
@@ -1705,47 +1800,47 @@ def _finalise_cell(cell: Dict[str, Any]) -> Dict[str, Any]:
         if march_pct is not None and required_pct is not None:
             cell["headroom_pct"] = march_pct - required_pct
         cell["feasible"] = cell["headroom_amt"] >= -1e-6
-
+ 
     if cell.get("milestone_pct") is None:
         cell["milestone_pct"] = cell.get("march_pct")
     return cell
-
-
+ 
+ 
 def scenario_multipliers(grid: pd.DataFrame, scenario_id: int) -> Dict[Tuple[str, str, str], float]:
     """
     Derive the per-asset FY-target multiplier for the selected scenario.
-
+ 
     Key is (sales type, asset, segment); segment is '*' unless the scenario
     differentiates by business segment.
     """
     multipliers: Dict[Tuple[str, str, str], float] = {}
-
+ 
     if scenario_id in (1, 7):
         return multipliers
-
+ 
     if scenario_id == 3:
         for sales in SALES_TYPES:
             for asset in ASSETS:
                 multipliers[(sales, asset, "*")] = S3_TARGET
         return multipliers
-
+ 
     if scenario_id == 4:
         for sales in SALES_TYPES:
             for asset in ASSETS:
                 multipliers[(sales, asset, "*")] = S4_TARGET
         return multipliers
-
+ 
     if scenario_id == 6:
         for sales in SALES_TYPES:
             for asset in ASSETS:
                 for segment in SEGMENT_ORDER:
                     multipliers[(sales, asset, segment)] = S6_SEGMENT_TARGETS.get(segment, 1.0)
         return multipliers
-
+ 
     # Scenarios 2 and 5 balance Debt and Liquid around a fixed Equity ambition.
     equity_mult = S2_EQUITY_TARGET if scenario_id == 2 else S5_EQUITY_TARGET
     overall_mult = S2_OVERALL_TARGET if scenario_id == 2 else S5_OVERALL_TARGET
-
+ 
     for sales in SALES_TYPES:
         targets = {
             asset: float(filter_grid(grid, sales=sales, asset=asset)["fy_target"].sum())
@@ -1761,10 +1856,10 @@ def scenario_multipliers(grid: pd.DataFrame, scenario_id: int) -> Dict[Tuple[str
         multipliers[(sales, "Equity", "*")] = equity_mult
         multipliers[(sales, "Debt", "*")] = balance_mult
         multipliers[(sales, "Liquid", "*")] = balance_mult
-
+ 
     return multipliers
-
-
+ 
+ 
 def _multiplier_for(
     multipliers: Dict[Tuple[str, str, str], float],
     sales: str,
@@ -1774,8 +1869,8 @@ def _multiplier_for(
     if (sales, asset, segment) in multipliers:
         return multipliers[(sales, asset, segment)]
     return multipliers.get((sales, asset, "*"))
-
-
+ 
+ 
 def apply_scenario_grid(
     grid: pd.DataFrame,
     scenario_id: int,
@@ -1786,7 +1881,7 @@ def apply_scenario_grid(
     kind = SCENARIOS[scenario_id]["kind"]
     dip = float(params.get("dip", 0.0)) if scenario_id == 3 else 0.0
     uplift = S1_RUNRATE_UPLIFT if scenario_id == 1 else None
-
+ 
     results: List[Dict[str, Any]] = []
     for row in grid.to_dict("records"):
         multiplier = _multiplier_for(multipliers, row["Sales"], row["Asset"], row["Segment"])
@@ -1800,15 +1895,15 @@ def apply_scenario_grid(
         })
         results.append(cell)
     return pd.DataFrame(results)
-
-
+ 
+ 
 SUMMABLE_FIELDS = [
     "fy_target", "ytd_target", "ytd_ach", "current_rr", "current_march",
     "scen_rr", "feb_mar_rr", "jan_required", "jan_amount",
     "march_required", "march_amount",
 ]
-
-
+ 
+ 
 def summarize_cells(subset: pd.DataFrame) -> Dict[str, Any]:
     """Aggregate scenario cells additively and rebuild every derived ratio."""
     cell: Dict[str, Any] = {}
@@ -1822,44 +1917,44 @@ def summarize_cells(subset: pd.DataFrame) -> Dict[str, Any]:
     cell["binding"] = None
     cell["feasible"] = None
     return _finalise_cell(cell)
-
-
+ 
+ 
 # --- Named scenario entry points (thin wrappers over the shared engine) -------
-
+ 
 def _scenario_frame(grid: pd.DataFrame, scenario_id: int, params: Dict[str, Any]) -> pd.DataFrame:
     return apply_scenario_grid(grid, scenario_id, params, scenario_multipliers(grid, scenario_id))
-
-
+ 
+ 
 def calculate_scenario_1(grid: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
     """+20% run-rate push from July onward."""
     return _scenario_frame(grid, 1, params)
-
-
+ 
+ 
 def calculate_scenario_2(grid: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
     """100% Equity and 75% overall FY target by January."""
     return _scenario_frame(grid, 2, params)
-
-
+ 
+ 
 def calculate_scenario_3(grid: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
     """100% of FY target by January, then a configurable Feb-Mar dip."""
     return _scenario_frame(grid, 3, params)
-
-
+ 
+ 
 def calculate_scenario_4(grid: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
     """120% of FY target by March."""
     return _scenario_frame(grid, 4, params)
-
-
+ 
+ 
 def calculate_scenario_5(grid: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
     """120% Equity and 100% overall FY target by March."""
     return _scenario_frame(grid, 5, params)
-
-
+ 
+ 
 def calculate_scenario_6(grid: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
     """Digital 140%, Retail B30 125%, Others 115% of their FY targets."""
     return _scenario_frame(grid, 6, params)
-
-
+ 
+ 
 SCENARIO_FUNCTIONS = {
     1: calculate_scenario_1,
     2: calculate_scenario_2,
@@ -1868,20 +1963,20 @@ SCENARIO_FUNCTIONS = {
     5: calculate_scenario_5,
     6: calculate_scenario_6,
 }
-
-
+ 
+ 
 # =============================================================================
 # 7. SCENARIO 7 - MOMENTUM ENGINE
 # =============================================================================
-
+ 
 def _momentum_sum(growth: float, months: int, tail_factors: Sequence[float]) -> float:
     """Sum of compounding monthly run-rate multiples, including leakage tail."""
     factor = 1.0 + growth
     build = sum(factor ** k for k in range(1, months + 1))
     tail = sum(f * factor ** months for f in tail_factors)
     return build + tail
-
-
+ 
+ 
 def solve_momentum_rate(
     current_rr: float,
     required_amount: float,
@@ -1892,7 +1987,7 @@ def solve_momentum_rate(
     """
     Back-solve the minimum month-on-month growth rate g such that the
     compounding trajectory delivers the required incremental amount.
-
+ 
     Returns 0.0 when no additional momentum is needed and None when the
     requirement cannot be met within the search bounds.
     """
@@ -1902,15 +1997,15 @@ def solve_momentum_rate(
         return None
     if need <= 0:
         return 0.0
-
+ 
     def shortfall(growth: float) -> float:
         return rr * _momentum_sum(growth, months, tail_factors) - need
-
+ 
     if shortfall(0.0) >= 0:
         return 0.0
     if shortfall(upper) < 0:
         return None
-
+ 
     low, high = 0.0, upper
     for _ in range(240):
         mid = (low + high) / 2.0
@@ -1919,8 +2014,8 @@ def solve_momentum_rate(
         else:
             low = mid
     return high
-
-
+ 
+ 
 def calculate_momentum_trajectory(
     current_rr: float,
     growth: Optional[float],
@@ -1938,8 +2033,8 @@ def calculate_momentum_trajectory(
     february_rr = january_rr * (1.0 - leakage)
     march_rr = february_rr * (1.0 - leakage)
     return build + [february_rr, march_rr]
-
-
+ 
+ 
 def calculate_leakage_impact(january_rr: float, leakage: float) -> Dict[str, float]:
     """February and March run rates after AUM leakage / run-rate pressure."""
     february_rr = _z(january_rr) * (1.0 - leakage)
@@ -1949,8 +2044,8 @@ def calculate_leakage_impact(january_rr: float, leakage: float) -> Dict[str, flo
         "march_rr": march_rr,
         "feb_mar_sales": february_rr + march_rr,
     }
-
-
+ 
+ 
 def calculate_momentum_headroom(
     march_amount: float,
     march_required: float,
@@ -1962,8 +2057,8 @@ def calculate_momentum_headroom(
     achieved_pct = safe_div(march_amount, fy_target)
     headroom_pct = None if achieved_pct is None else achieved_pct - march_target_pct
     return {"headroom_amt": headroom_amt, "headroom_pct": headroom_pct}
-
-
+ 
+ 
 def calculate_scenario_7(
     fy_target: float,
     ytd_target: float,
@@ -1972,30 +2067,30 @@ def calculate_scenario_7(
 ) -> Dict[str, Any]:
     """
     Momentum build-up model.
-
+ 
     Solves for the month-on-month growth rate that simultaneously satisfies the
     January milestone and, after Feb-Mar leakage, the March ambition.
     """
     jan_target_pct = float(params.get("jan_target", S7_DEFAULT_JAN_TARGET))
     mar_target_pct = float(params.get("mar_target", S7_DEFAULT_MAR_TARGET))
     leakage = float(params.get("leakage", S7_DEFAULT_LEAKAGE))
-
+ 
     stats = current_asset_stats(fy_target, ytd_target, ytd_ach)
     cell = _blank_cell(stats)
     ach = stats["ytd_ach"]
     current_rr = stats["current_rr"] or 0.0
-
+ 
     jan_required = max(jan_target_pct * stats["fy_target"], ach)
     mar_required = max(mar_target_pct * stats["fy_target"], ach)
     tail = ((1.0 - leakage), (1.0 - leakage) ** 2)
-
+ 
     growth_jan = solve_momentum_rate(current_rr, jan_required - ach, MONTHS_JUL_JAN)
     growth_mar = solve_momentum_rate(current_rr, mar_required - ach, MONTHS_JUL_JAN, tail)
-
+ 
     note = ""
     binding = None
     flat_rate = None
-
+ 
     if current_rr <= 0:
         # Momentum compounding is undefined on a non-positive run rate:
         # fall back to the flat run rate required to hold both milestones.
@@ -2019,21 +2114,21 @@ def calculate_scenario_7(
         growth = max(candidates)
         binding = "March" if (growth_mar is not None and growth == growth_mar
                               and (growth_jan is None or growth_mar >= growth_jan)) else "January"
-
+ 
     trajectory = calculate_momentum_trajectory(current_rr, growth, leakage, flat_rate)
     build_phase = trajectory[:MONTHS_JUL_JAN]
     jan_amount = ach + sum(build_phase)
     january_rr = build_phase[-1] if build_phase else 0.0
     leak = calculate_leakage_impact(january_rr, leakage)
     march_amount = jan_amount + leak["feb_mar_sales"]
-
+ 
     headroom = calculate_momentum_headroom(
         march_amount, mar_required, stats["fy_target"], mar_target_pct
     )
     shortfall = max(mar_required - march_amount, 0.0)
     denominator = 1.0 + tail[0] + tail[1]
     additional_jan_rr = shortfall / denominator if denominator else None
-
+ 
     cell.update({
         "scen_rr": january_rr,
         "feb_mar_rr": leak["february_rr"],
@@ -2064,15 +2159,118 @@ def calculate_scenario_7(
         (january_rr / current_rr) - 1.0 if current_rr and current_rr > 0 else None
     )
     return cell
-
-
+ 
+ 
+# =============================================================================
+# 7A. SCENARIO 8/9 - CHANNEL SIMULATOR & MIX OPTIMISER
+# =============================================================================
+ 
+def _s8_channel_params(params: Dict[str, Any], channel: str) -> Tuple[float, float, float, float]:
+    growth = float(params.get("channel_growth", {}).get(channel, S8_DEFAULT_GROWTH[channel]))
+    jan_target = float(params.get("channel_jan_target", {}).get(channel, S8_DEFAULT_JAN_TARGET[channel]))
+    mar_target = float(params.get("channel_mar_target", {}).get(channel, S8_DEFAULT_MAR_TARGET[channel]))
+    leakage = float(params.get("leakage", S8_DEFAULT_LEAKAGE))
+    return growth, jan_target, mar_target, leakage
+ 
+ 
+def calculate_scenario_8_cell(fy_target: float, ytd_target: float, ytd_ach: float, channel: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Fixed-growth channel trajectory with independent Jan-2027 and Mar-2027 targets."""
+    stats = current_asset_stats(fy_target, ytd_target, ytd_ach)
+    cell = _blank_cell(stats)
+    growth, jan_target_pct, mar_target_pct, leakage = _s8_channel_params(params, channel)
+    current_rr = _z(stats["current_rr"])
+    trajectory = calculate_momentum_trajectory(current_rr, growth, leakage)
+    jan_amount = _z(stats["ytd_ach"]) + sum(trajectory[:MONTHS_JUL_JAN])
+    march_amount = jan_amount + sum(trajectory[MONTHS_JUL_JAN:])
+    jan_required = max(jan_target_pct * stats["fy_target"], _z(stats["ytd_ach"]))
+    march_required = max(mar_target_pct * stats["fy_target"], _z(stats["ytd_ach"]))
+    jan_gap = jan_amount - jan_required
+    march_gap = march_amount - march_required
+    cell.update({
+        "channel": channel, "scen_rr": trajectory[MONTHS_JUL_JAN-1] if trajectory else current_rr,
+        "feb_mar_rr": trajectory[MONTHS_JUL_JAN] if len(trajectory) > MONTHS_JUL_JAN else None,
+        "march_rr": trajectory[-1] if trajectory else None,
+        "jan_required": jan_required, "jan_amount": jan_amount,
+        "march_required": march_required, "march_amount": march_amount,
+        "milestone_pct": jan_target_pct, "march_target_pct": mar_target_pct,
+        "momentum_g": growth, "leakage": leakage, "trajectory": trajectory,
+        "jan_buffer": jan_gap, "jan_buffer_pct": safe_div(jan_gap, jan_required),
+        "headroom_amt": march_gap, "headroom_pct": safe_div(march_gap, march_required),
+        "feasible": jan_gap >= -1e-6 and march_gap >= -1e-6,
+        "binding": "January" if jan_gap < 0 else ("March" if march_gap < 0 else "None"),
+        "additional_march_sales": max(-march_gap, 0.0),
+        "additional_jan_rr": max(-jan_gap, 0.0) / MONTHS_JUL_JAN,
+    })
+    return _finalise_cell(cell)
+ 
+ 
+def calculate_scenario_8_grid(grid: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
+    rows = []
+    for row in grid.to_dict("records"):
+        channel = row.get("Channel", "Unclassified")
+        cell = calculate_scenario_8_cell(row["fy_target"], row["ytd_target"], row["ytd_ach"], channel, params)
+        cell.update({k: row[k] for k in ("Vertical", "Segment", "Channel", "Sales", "Asset")})
+        rows.append(cell)
+    return pd.DataFrame(rows)
+ 
+ 
+def calculate_scenario_9_grid(grid: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
+    """Optimiser: solve minimum MoM growth per channel to meet its Jan/Mar targets."""
+    rows = []
+    for row in grid.to_dict("records"):
+        channel = row.get("Channel", "Unclassified")
+        _, jan_target, mar_target, leakage = _s8_channel_params(params, channel)
+        stats = current_asset_stats(row["fy_target"], row["ytd_target"], row["ytd_ach"])
+        ach = _z(stats["ytd_ach"]); rr = _z(stats["current_rr"])
+        jan_req = max(jan_target * stats["fy_target"], ach)
+        mar_req = max(mar_target * stats["fy_target"], ach)
+        gj = solve_momentum_rate(rr, jan_req-ach, MONTHS_JUL_JAN)
+        gm = solve_momentum_rate(rr, mar_req-ach, MONTHS_JUL_JAN, ((1-leakage), (1-leakage)**2))
+        growth = max([g for g in (gj, gm) if g is not None], default=0.0)
+        cell = calculate_scenario_8_cell(row["fy_target"], row["ytd_target"], row["ytd_ach"], channel, {
+            **params, "channel_growth": {**params.get("channel_growth", {}), channel: growth}
+        })
+        cell.update({k: row[k] for k in ("Vertical", "Segment", "Channel", "Sales", "Asset")})
+        cell["optimized_growth"] = growth
+        rows.append(cell)
+    return pd.DataFrame(rows)
+ 
+ 
+def build_channel_scenario_analysis(model: "ScenarioModel", basis: str) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    rows = []
+    frame = model.scenario_grid
+    for channel in CHANNELS:
+        subset = frame[(frame["Sales"] == basis) & (frame["Channel"] == channel)]
+        if subset.empty:
+            continue
+        cell = summarize_cells(subset)
+        growth, jan_target, mar_target, leakage = _s8_channel_params(model.params, channel)
+        rows.append({
+            "Channel": channel, "MoM Growth": growth,
+            "Jan 2027 Target": jan_target, "Jan Achievement": cell.get("jan_pct"),
+            "Jan Gap / Headroom": cell.get("jan_buffer"),
+            "Mar 2027 Target": mar_target, "Mar Achievement": cell.get("march_pct"),
+            "Mar Gap / Headroom": cell.get("headroom_amt"),
+            "Current Run Rate": cell.get("current_rr"),
+            "Jan Exit Run Rate": cell.get("scen_rr"),
+            "March Incremental Sales": cell.get("incremental_sales"),
+        })
+    formats = {
+        "Channel":"txt", "MoM Growth":"pct_signed", "Jan 2027 Target":"pct",
+        "Jan Achievement":"pct", "Jan Gap / Headroom":"cr_signed",
+        "Mar 2027 Target":"pct", "Mar Achievement":"pct", "Mar Gap / Headroom":"cr_signed",
+        "Current Run Rate":"cr", "Jan Exit Run Rate":"cr", "March Incremental Sales":"cr_signed"
+    }
+    return pd.DataFrame(rows), formats
+ 
+ 
 # =============================================================================
 # 8. SCENARIO MODEL - ONE INTERFACE FOR EVERY VIEW
 # =============================================================================
-
+ 
 class ScenarioModel:
     """Evaluates the selected scenario for any slice of the business."""
-
+ 
     def __init__(self, scenario_id: int, grid: pd.DataFrame, params: Dict[str, Any]):
         self.scenario_id = scenario_id
         self.meta = SCENARIOS[scenario_id]
@@ -2082,9 +2280,13 @@ class ScenarioModel:
         self._cache: Dict[Tuple, Dict[str, Any]] = {}
         if scenario_id == 7:
             self.scenario_grid = None
+        elif scenario_id == 8:
+            self.scenario_grid = calculate_scenario_8_grid(grid, params)
+        elif scenario_id == 9:
+            self.scenario_grid = calculate_scenario_9_grid(grid, params)
         else:
             self.scenario_grid = SCENARIO_FUNCTIONS[scenario_id](grid, params)
-
+ 
     # -- core accessor --------------------------------------------------------
     def cell(
         self,
@@ -2092,14 +2294,15 @@ class ScenarioModel:
         asset: Optional[str] = None,
         vertical: Optional[str] = None,
         segment: Optional[str] = None,
+        channel: Optional[str] = None,
     ) -> Dict[str, Any]:
         key = (sales, asset, vertical, segment)
         if key in self._cache:
             return self._cache[key]
-
+ 
         if self.scenario_id == 7:
             subset = filter_grid(self.grid, sales=sales, asset=asset,
-                                 vertical=vertical, segment=segment)
+                                 vertical=vertical, segment=segment, channel=channel)
             cell = calculate_scenario_7(
                 subset["fy_target"].sum(),
                 subset["ytd_target"].sum(),
@@ -2115,37 +2318,39 @@ class ScenarioModel:
                 mask &= frame["Vertical"] == vertical
             if segment is not None:
                 mask &= frame["Segment"] == segment
+            if channel is not None and "Channel" in frame.columns:
+                mask &= frame["Channel"] == channel
             cell = summarize_cells(frame.loc[mask])
-
+ 
         self._cache[key] = cell
         return cell
-
+ 
     # -- convenience views ----------------------------------------------------
     def assets(self, sales: str, **filters: Any) -> Dict[str, Dict[str, Any]]:
         return {asset: self.cell(sales, asset=asset, **filters) for asset in ASSETS}
-
+ 
     def baseline(self, sales: str, **filters: Any) -> Dict[str, Any]:
         return summarize_current(self.grid, sales=sales, **filters)
-
+ 
     def implied_milestones(self, sales: str) -> Dict[str, Optional[float]]:
         return {
             asset: _multiplier_for(self.multipliers, sales, asset, "*")
             for asset in ASSETS
         }
-
+ 
     def available_segments(self) -> List[str]:
         present = set(self.grid["Segment"].unique())
         return [s for s in SEGMENT_ORDER if s in present]
-
+ 
     def available_verticals(self) -> List[str]:
         present = set(self.grid["Vertical"].unique())
         return [v for v in VERTICALS if v in present]
-
-
+ 
+ 
 # =============================================================================
 # 9. REVENUE ENGINE
 # =============================================================================
-
+ 
 def calculate_revenue(cells_by_asset: Dict[str, Dict[str, Any]], field: str) -> Dict[str, Any]:
     """Asset-class revenue from a set of scenario cells. No blended rate."""
     by_asset: Dict[str, Optional[float]] = {}
@@ -2158,13 +2363,13 @@ def calculate_revenue(cells_by_asset: Dict[str, Dict[str, Any]], field: str) -> 
         by_asset[asset] = revenue
         total += 0.0 if revenue is None else revenue
     return {"by_asset": by_asset, "sales_by_asset": sales_by_asset, "total": total}
-
-
+ 
+ 
 def calculate_baseline_revenue(cells_by_asset: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     """Baseline revenue on the current-run-rate March projection (scenario independent)."""
     return calculate_revenue(cells_by_asset, "current_march")
-
-
+ 
+ 
 def calculate_incremental_revenue(
     scenario_revenue: Dict[str, Any],
     baseline_revenue: Dict[str, Any],
@@ -2189,8 +2394,8 @@ def calculate_incremental_revenue(
             for asset in ASSETS
         },
     }
-
-
+ 
+ 
 def revenue_bundle(model: ScenarioModel, basis: str, **filters: Any) -> Dict[str, Any]:
     """Baseline / scenario / incremental revenue for any slice of the business."""
     cells = model.assets(basis, **filters)
@@ -2205,12 +2410,12 @@ def revenue_bundle(model: ScenarioModel, basis: str, **filters: Any) -> Dict[str
         "january": january,
         "incremental": incremental,
     }
-
-
+ 
+ 
 # =============================================================================
 # 10. TABLE BUILDERS
 # =============================================================================
-
+ 
 def build_current_overview(model: ScenarioModel) -> Tuple[pd.DataFrame, Dict[str, str]]:
     """Baseline table - identical for every scenario."""
     rows = []
@@ -2234,8 +2439,8 @@ def build_current_overview(model: ScenarioModel) -> Tuple[pd.DataFrame, Dict[str
         "Current March Projection": "cr", "Current March Projection %": "pct",
     }
     return pd.DataFrame(rows), formats
-
-
+ 
+ 
 def summarize_scenario(model: ScenarioModel, sales: str) -> Dict[str, Any]:
     """Headline current-versus-scenario numbers for one sales basis."""
     cell = model.cell(sales)
@@ -2252,8 +2457,8 @@ def summarize_scenario(model: ScenarioModel, sales: str) -> Dict[str, Any]:
         "Scenario March Achievement %": cell["march_pct"],
         "Incremental Sales": cell["incremental_sales"],
     }
-
-
+ 
+ 
 def build_comparison(model: ScenarioModel) -> Tuple[pd.DataFrame, Dict[str, str]]:
     """Current versus selected scenario, for Gross Sales and Net Sales."""
     rows = [summarize_scenario(model, sales) for sales in SALES_TYPES]
@@ -2265,8 +2470,8 @@ def build_comparison(model: ScenarioModel) -> Tuple[pd.DataFrame, Dict[str, str]
         "Scenario March Achievement %": "pct", "Incremental Sales": "cr_signed",
     }
     return pd.DataFrame(rows), formats
-
-
+ 
+ 
 def build_revenue_impact(model: ScenarioModel, basis: str) -> Tuple[pd.DataFrame, Dict[str, str]]:
     """Revenue by asset class - never a blended rate."""
     bundle = revenue_bundle(model, basis)
@@ -2296,8 +2501,8 @@ def build_revenue_impact(model: ScenarioModel, basis: str) -> Tuple[pd.DataFrame
         "Incremental Revenue": "cr1_signed", "Revenue Contribution %": "pct",
     }
     return pd.DataFrame(rows), formats
-
-
+ 
+ 
 def build_vertical_summary(model: ScenarioModel) -> Tuple[pd.DataFrame, Dict[str, str]]:
     """Retail, DHNI and VRM, for Gross Sales and Net Sales."""
     rows = []
@@ -2328,8 +2533,8 @@ def build_vertical_summary(model: ScenarioModel) -> Tuple[pd.DataFrame, Dict[str
         "Scenario Revenue": "cr1", "Incremental Revenue": "cr1_signed",
     }
     return pd.DataFrame(rows), formats
-
-
+ 
+ 
 def build_asset_breakdown(model: ScenarioModel, sales: str) -> Tuple[pd.DataFrame, Dict[str, str]]:
     """Equity / Debt / Liquid split within each vertical."""
     rows = []
@@ -2368,8 +2573,8 @@ def build_asset_breakdown(model: ScenarioModel, sales: str) -> Tuple[pd.DataFram
         "Incremental Revenue": "cr1_signed",
     }
     return pd.DataFrame(rows), formats
-
-
+ 
+ 
 def build_segment_scenario_analysis(
     model: ScenarioModel, sales: str
 ) -> Tuple[pd.DataFrame, Dict[str, str]]:
@@ -2410,8 +2615,8 @@ def build_segment_scenario_analysis(
         "Incremental Amount": "cr_signed",
     }
     return pd.DataFrame(rows), formats
-
-
+ 
+ 
 def build_momentum_analysis(cell: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, str]]:
     """Scenario 7 - month-by-month momentum trajectory."""
     trajectory = cell.get("trajectory") or []
@@ -2420,7 +2625,7 @@ def build_momentum_analysis(cell: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
     leakage = _z(cell.get("leakage"))
     fy_target = cell.get("fy_target")
     cumulative = _z(cell.get("ytd_ach"))
-
+ 
     rows = []
     previous = current_rr
     for position, month in enumerate(FUTURE_MONTHS):
@@ -2450,8 +2655,8 @@ def build_momentum_analysis(cell: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
         "Cumulative Achievement": "cr", "Achievement %": "pct",
     }
     return pd.DataFrame(rows), formats
-
-
+ 
+ 
 def build_momentum_by_group(
     model: ScenarioModel, sales: str, dimension: str
 ) -> Tuple[pd.DataFrame, Dict[str, str]]:
@@ -2462,7 +2667,7 @@ def build_momentum_by_group(
     else:
         keys = [("Vertical", v, {"vertical": v}) for v in model.available_verticals()]
         first_column = "Vertical"
-
+ 
     rows = []
     for _, name, filters in keys:
         cell = model.cell(sales, **filters)
@@ -2485,8 +2690,8 @@ def build_momentum_by_group(
         "Headroom / Shortfall": "cr_signed",
     }
     return pd.DataFrame(rows), formats
-
-
+ 
+ 
 def build_monthly_revenue(model: ScenarioModel, basis: str) -> Tuple[pd.DataFrame, Dict[str, str]]:
     """Scenario 7 - monthly revenue implied by the momentum trajectory."""
     trajectories = {
@@ -2509,8 +2714,8 @@ def build_monthly_revenue(model: ScenarioModel, basis: str) -> Tuple[pd.DataFram
     for asset in ASSETS:
         formats[f"{asset} Revenue"] = "cr1"
     return pd.DataFrame(rows), formats
-
-
+ 
+ 
 def build_leakage_sensitivity(
     model: ScenarioModel, basis: str
 ) -> Tuple[pd.DataFrame, Dict[str, str]]:
@@ -2537,8 +2742,8 @@ def build_leakage_sensitivity(
         "Headroom / Shortfall": "cr_signed",
     }
     return pd.DataFrame(rows), formats
-
-
+ 
+ 
 def build_scenario_guide(model: ScenarioModel, basis: str) -> pd.DataFrame:
     rows = []
     for scenario_id in SCENARIO_ORDER:
@@ -2586,20 +2791,20 @@ def build_scenario_guide(model: ScenarioModel, basis: str) -> pd.DataFrame:
             "Milestone": "", "Selected": "",
         })
     return pd.DataFrame(rows)
-
-
+ 
+ 
 # =============================================================================
 # 11. EXCEL EXPORT
 # =============================================================================
-
+ 
 def _round_frame(frame: pd.DataFrame) -> pd.DataFrame:
     out = frame.copy()
     for column in out.columns:
         if pd.api.types.is_numeric_dtype(out[column]):
             out[column] = out[column].astype(float).round(4)
     return out
-
-
+ 
+ 
 def make_export_excel(model: ScenarioModel, basis: str) -> bytes:
     """Build the management export workbook for the selected scenario."""
     sheets: List[Tuple[str, pd.DataFrame]] = []
@@ -2610,7 +2815,7 @@ def make_export_excel(model: ScenarioModel, basis: str) -> bytes:
     sheets.append(("Retail-DHNI-VRM Summary", build_vertical_summary(model)[0]))
     sheets.append(("Gross Sales Breakdown", build_asset_breakdown(model, "GS")[0]))
     sheets.append(("Net Sales Breakdown", build_asset_breakdown(model, "NS")[0]))
-
+ 
     segment_model = model if model.scenario_id == 6 else ScenarioModel(6, model.grid, model.params)
     segment_frames = []
     for sales in SALES_TYPES:
@@ -2618,7 +2823,7 @@ def make_export_excel(model: ScenarioModel, basis: str) -> bytes:
         frame.insert(0, "Sales", SALES_LABEL[sales])
         segment_frames.append(frame)
     sheets.append(("Scenario 6 Segments", pd.concat(segment_frames, ignore_index=True)))
-
+ 
     momentum_model = model if model.scenario_id == 7 else ScenarioModel(7, model.grid, model.params)
     momentum_frames = []
     for sales in SALES_TYPES:
@@ -2633,15 +2838,15 @@ def make_export_excel(model: ScenarioModel, basis: str) -> bytes:
             momentum_frames.append(frame)
     sheets.append(("Scenario 7 Momentum", pd.concat(momentum_frames, ignore_index=True)))
     sheets.append(("S7 Monthly Revenue", build_monthly_revenue(momentum_model, basis)[0]))
-
+ 
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         for name, frame in sheets:
             _round_frame(frame).to_excel(writer, sheet_name=name[:31], index=False)
         _style_workbook(writer)
     return buffer.getvalue()
-
-
+ 
+ 
 def _style_workbook(writer: Any) -> None:
     """Bold headers, frozen top row and sensible column widths."""
     try:
@@ -2663,12 +2868,12 @@ def _style_workbook(writer: Any) -> None:
                 value = "" if cell.value is None else str(cell.value)
                 longest = max(longest, min(len(value), 60))
             worksheet.column_dimensions[letter].width = max(12, min(longest + 3, 62))
-
-
+ 
+ 
 # =============================================================================
 # 12. PRESENTATION LAYER - THEME
 # =============================================================================
-
+ 
 CUSTOM_CSS = """
 <style>
 :root {
@@ -2683,23 +2888,23 @@ CUSTOM_CSS = """
     --green: #2F7D5B;
     --red: #B64B45;
 }
-
+ 
 .stApp, [data-testid="stAppViewContainer"] {
     background: linear-gradient(180deg, #FBF8EF 0%, var(--ivory) 100%);
 }
 [data-testid="stHeader"] { background: transparent; }
-
+ 
 .block-container, [data-testid="stMainBlockContainer"] {
     padding-top: 1.25rem;
     padding-bottom: 3rem;
     max-width: 1680px;
 }
-
+ 
 .stApp, .stApp p, .stApp span, .stApp li, .stApp label,
 .stApp h1, .stApp h2, .stApp h3, .stApp h4 {
     color: var(--ink);
 }
-
+ 
 .app-title {
     font-size: 1.8rem;
     font-weight: 800;
@@ -2717,7 +2922,7 @@ CUSTOM_CSS = """
     background: linear-gradient(90deg, var(--gold), transparent);
     margin: 12px 0 5px 0;
 }
-
+ 
 .section-label {
     font-size: 0.74rem;
     letter-spacing: 0.14em;
@@ -2730,7 +2935,7 @@ CUSTOM_CSS = """
     background: linear-gradient(90deg, rgba(184,146,59,.10), transparent 55%);
     border-radius: 0 8px 8px 0;
 }
-
+ 
 .subsection-title {
     color: var(--gold-deep);
     font-size: 0.76rem;
@@ -2739,14 +2944,14 @@ CUSTOM_CSS = """
     text-transform: uppercase;
     margin: 13px 0 5px 0;
 }
-
+ 
 .note {
     color: var(--muted);
     font-size: 0.79rem;
     line-height: 1.5;
     margin: 5px 0 12px 0;
 }
-
+ 
 .callout, .scenario-highlight {
     background: var(--ivory-card);
     border: 1px solid var(--gold-soft);
@@ -2763,7 +2968,7 @@ CUSTOM_CSS = """
 .callout-ok { border-left-color: var(--green); }
 .tag-ok { color: var(--green); font-weight: 700; }
 .tag-warn { color: #A96A22; font-weight: 700; }
-
+ 
 [data-testid="stMetric"], [data-testid="metric-container"] {
     background: linear-gradient(145deg, #FFF8DF 0%, #F3D98E 100%);
     border: 1px solid #C49B39;
@@ -2787,7 +2992,7 @@ CUSTOM_CSS = """
     font-weight: 800;
 }
 [data-testid="stMetricDelta"] { font-size: 0.76rem !important; }
-
+ 
 [data-testid="stDataFrame"] {
     border: 1px solid var(--gold-soft);
     border-radius: 10px;
@@ -2795,7 +3000,7 @@ CUSTOM_CSS = """
     background: var(--ivory-card);
     box-shadow: 0 2px 8px rgba(93, 71, 24, .05);
 }
-
+ 
 .stTabs [data-baseweb="tab-list"] {
     gap: 5px;
     border-bottom: 1px solid var(--gold-soft);
@@ -2810,13 +3015,13 @@ CUSTOM_CSS = """
     font-weight: 800;
     border-bottom: 2px solid var(--gold);
 }
-
+ 
 [data-testid="stExpander"] {
     border: 1px solid var(--gold-soft) !important;
     border-radius: 10px;
     background: rgba(255,253,247,.82);
 }
-
+ 
 [data-testid="stSidebar"], [data-testid="stSidebarContent"] {
     background: #F1E6CF !important;
     border-right: 1px solid var(--gold-soft);
@@ -2824,7 +3029,7 @@ CUSTOM_CSS = """
 [data-testid="stSidebar"] * { color: var(--ink) !important; }
 [data-testid="stSidebar"] [data-testid="stCaptionContainer"] p,
 [data-testid="stSidebar"] small { color: var(--muted) !important; }
-
+ 
 [data-testid="stSidebar"] [data-baseweb="select"] > div,
 [data-testid="stSidebar"] [data-baseweb="input"],
 [data-testid="stSidebar"] input,
@@ -2834,12 +3039,12 @@ CUSTOM_CSS = """
     color: var(--ink) !important;
     border-radius: 9px !important;
 }
-
+ 
 [data-testid="stSidebar"] [data-testid="stExpander"] {
     background: rgba(255,253,247,.88) !important;
     border: 1px solid var(--gold-soft) !important;
 }
-
+ 
 .sidebar-title {
     font-size: 0.74rem;
     letter-spacing: 0.14em;
@@ -2874,7 +3079,7 @@ CUSTOM_CSS = """
     margin-top: 7px;
     font-weight: 700;
 }
-
+ 
 .stButton > button,
 .stDownloadButton > button {
     background: var(--gold-deep) !important;
@@ -2889,14 +3094,14 @@ CUSTOM_CSS = """
     color: #FFFDF7 !important;
     border-color: var(--gold) !important;
 }
-
+ 
 [data-testid="stVegaLiteChart"] text { fill: var(--ink) !important; }
 [data-testid="stVegaLiteChart"] .role-axis-grid line { stroke: #E5D9BA !important; }
 [data-testid="stVegaLiteChart"] .role-axis line,
 [data-testid="stVegaLiteChart"] .role-axis path { stroke: var(--gold-soft) !important; }
-
+ 
 hr { border-color: var(--gold-soft) !important; }
-
+ 
 .gold-star-card {
     background: linear-gradient(145deg, #F4D77B 0%, #C99A2E 100%);
     border: 1px solid #A77A1D;
@@ -2944,17 +3149,29 @@ hr { border-color: var(--gold-soft) !important; }
     color: #2A2113;
     box-shadow: 0 6px 16px rgba(103, 73, 14, .16);
 }
-
+ 
+/* Apple-inspired management cockpit: clean hierarchy, glass surfaces, restrained motion. */
+body, .stApp { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", Inter, system-ui, sans-serif !important; }
+.stButton > button, .stDownloadButton > button, .stSelectbox, .stMultiSelect, .stSlider { border-radius: 14px !important; }
+.stButton > button, .stDownloadButton > button { transition: transform .18s ease, box-shadow .18s ease, background .18s ease; box-shadow: 0 2px 10px rgba(0,0,0,.06); }
+.stButton > button:hover, .stDownloadButton > button:hover { transform: translateY(-1px); box-shadow: 0 8px 20px rgba(0,0,0,.10); }
+[data-testid="stMetric"], [data-testid="metric-container"], .sidebar-card, .callout, .scenario-highlight { backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); }
+[data-testid="stMetric"], [data-testid="metric-container"] { border-radius: 18px !important; border-top-width: 2px !important; box-shadow: 0 8px 28px rgba(50,40,20,.08) !important; }
+.stSlider [role="slider"] { transition: transform .15s ease; }
+.stSlider [role="slider"]:active { transform: scale(1.08); }
+.channel-simulator-note { padding: 12px 16px; border-radius: 16px; background: rgba(255,255,255,.60); border: 1px solid rgba(184,146,59,.22); color: var(--muted); margin-bottom: 12px; }
+@media (prefers-reduced-motion: reduce) { * { animation-duration: .01ms !important; transition-duration: .01ms !important; } }
+ 
 </style>
 """
-
-
+ 
+ 
 def rerun() -> None:
     handler = getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None)
     if handler is not None:
         handler()
-
-
+ 
+ 
 def _dataframe_kwargs() -> Dict[str, Any]:
     try:
         parameters = inspect.signature(st.dataframe).parameters
@@ -2965,25 +3182,25 @@ def _dataframe_kwargs() -> Dict[str, Any]:
     if "use_container_width" in parameters:
         return {"use_container_width": True}
     return {}
-
-
+ 
+ 
 def show_table(frame: pd.DataFrame, formats: Optional[Dict[str, str]] = None) -> None:
     display = format_table(frame, formats) if formats else frame
     try:
         st.dataframe(display, hide_index=True, **_dataframe_kwargs())
     except TypeError:  # pragma: no cover - very old Streamlit
         st.dataframe(display)
-
-
+ 
+ 
 def section(title: str) -> None:
     st.markdown(f"<div class='section-label'>{title}</div>", unsafe_allow_html=True)
-
-
+ 
+ 
 def callout(text: str, tone: str = "") -> None:
     css = "callout" + (f" callout-{tone}" if tone else "")
     st.markdown(f"<div class='{css}'>{text}</div>", unsafe_allow_html=True)
-
-
+ 
+ 
 def kpi_row(items: Sequence[Tuple]) -> None:
     if not items:
         return
@@ -2997,18 +3214,18 @@ def kpi_row(items: Sequence[Tuple]) -> None:
                 st.metric(label, value)
             else:
                 st.metric(label, value, delta, delta_color=delta_color)
-
-
+ 
+ 
 # =============================================================================
 # 13. UPLOAD GATE
 # =============================================================================
-
+ 
 def render_upload_screen() -> None:
     _, middle, _ = st.columns([1, 2, 1])
     with middle:
         _render_upload_body()
-
-
+ 
+ 
 def _render_upload_body() -> None:
     st.markdown(f"<div class='app-title'>{APP_TITLE}</div>", unsafe_allow_html=True)
     st.markdown(
@@ -3017,7 +3234,7 @@ def _render_upload_body() -> None:
         unsafe_allow_html=True,
     )
     st.markdown("<div class='app-rule'></div>", unsafe_allow_html=True)
-
+ 
     uploaded = st.file_uploader(
         "Workbook", type=["xlsx", "xlsm"], label_visibility="collapsed",
     )
@@ -3036,16 +3253,39 @@ def _render_upload_body() -> None:
         else:
             st.session_state["workbook"] = payload
             rerun()
-
-
+ 
+ 
 # =============================================================================
 # 14. SIDEBAR
 # =============================================================================
-
+ 
+def render_channel_controls(records: pd.DataFrame) -> Dict[str, Any]:
+    """Apple-style channel mapping controls for Scenario 8/9."""
+    suggestions = identify_channels(records)
+    mapping: Dict[str, Any] = dict(st.session_state.get("channel_mapping") or suggestions)
+    usable_columns = [f for f in META_FIELDS + ["Vertical"] if f in records.columns and text_column(records, f).ne("").any()]
+    with st.sidebar.expander("Channel mapping", expanded=False):
+        st.caption("Map workbook metadata to Digital, VRM, EM, B30, T30, T8, DHNI, Retail and Institutional. Unmapped rows remain Unclassified.")
+        for channel in CHANNELS:
+            options = ["(not mapped)"] + usable_columns
+            current = mapping.get(channel, {}).get("column", "(not mapped)")
+            idx = options.index(current) if current in options else 0
+            column = st.selectbox(channel, options, index=idx, key=f"ch_col_{channel}")
+            if column == "(not mapped)":
+                mapping.pop(channel, None); continue
+            values = sorted({v for v in text_column(records, column) if v.strip()})
+            preset = [v for v in mapping.get(channel, {}).get("values", []) if v in values]
+            chosen = st.multiselect(f"{channel} values", values, default=preset, key=f"ch_vals_{channel}_{column}")
+            if chosen: mapping[channel] = {"column": column, "values": list(chosen)}
+            else: mapping.pop(channel, None)
+    st.session_state["channel_mapping"] = mapping
+    return mapping
+ 
+ 
 def render_sidebar(records: pd.DataFrame) -> Tuple[int, Dict[str, Any], str, Dict[str, Any]]:
     sidebar = st.sidebar
     sidebar.markdown("<div class='sidebar-title'>Scenario Navigator</div>", unsafe_allow_html=True)
-
+ 
     scenario_options = SCENARIO_ORDER
     scenario_id = sidebar.selectbox(
         "Scenario",
@@ -3066,21 +3306,24 @@ def render_sidebar(records: pd.DataFrame) -> Tuple[int, Dict[str, Any], str, Dic
         "</div>",
         unsafe_allow_html=True,
     )
-
+ 
     params: Dict[str, Any] = {
         "dip": S3_DEFAULT_DIP,
         "jan_target": S7_DEFAULT_JAN_TARGET,
         "mar_target": S7_DEFAULT_MAR_TARGET,
         "leakage": S7_DEFAULT_LEAKAGE,
+        "channel_growth": dict(S8_DEFAULT_GROWTH),
+        "channel_jan_target": dict(S8_DEFAULT_JAN_TARGET),
+        "channel_mar_target": dict(S8_DEFAULT_MAR_TARGET),
     }
-
+ 
     if scenario_id == 3:
         sidebar.markdown("<div class='sidebar-title'>Scenario controls</div>", unsafe_allow_html=True)
         params["dip"] = sidebar.slider(
             "Feb-Mar Run-Rate Dip", min_value=0, max_value=60,
             value=int(S3_DEFAULT_DIP * 100), step=5, format="%d%%", key="s3_dip",
         ) / 100.0
-
+ 
     if scenario_id == 7:
         sidebar.markdown("<div class='sidebar-title'>Scenario controls</div>", unsafe_allow_html=True)
         params["jan_target"] = sidebar.slider(
@@ -3095,9 +3338,34 @@ def render_sidebar(records: pd.DataFrame) -> Tuple[int, Dict[str, Any], str, Dic
             "Feb-Mar AUM Leakage", min_value=0, max_value=30,
             value=int(S7_DEFAULT_LEAKAGE * 100), step=1, format="%d%%", key="s7_leak",
         ) / 100.0
-
+ 
+    if scenario_id in (8, 9):
+        sidebar.markdown("<div class='sidebar-title'>Channel simulator controls</div>", unsafe_allow_html=True)
+        params["leakage"] = sidebar.slider(
+            "Feb-Mar AUM Leakage", 0, 30, int(S8_DEFAULT_LEAKAGE * 100), 1, format="%d%%", key="s8_leakage"
+        ) / 100.0
+        channel_mapping = render_channel_controls(records)
+        if scenario_id == 8:
+            with sidebar.expander("Channel assumptions", expanded=True):
+                for channel in CHANNELS:
+                    cols = st.columns(3)
+                    params["channel_growth"][channel] = cols[0].slider(
+                        f"{channel} · MoM", -20, 30, int(S8_DEFAULT_GROWTH[channel] * 100), 1, format="%d%%", key=f"s8_g_{channel}"
+                    ) / 100.0
+                    params["channel_jan_target"][channel] = cols[1].slider(
+                        "Jan 2027", 80, 180, int(S8_DEFAULT_JAN_TARGET[channel] * 100), 1, format="%d%%", key=f"s8_j_{channel}"
+                    ) / 100.0
+                    params["channel_mar_target"][channel] = cols[2].slider(
+                        "Mar 2027", 80, 200, int(S8_DEFAULT_MAR_TARGET[channel] * 100), 1, format="%d%%", key=f"s8_m_{channel}"
+                    ) / 100.0
+        else:
+            params["optimizer_target"] = sidebar.slider("Portfolio March ambition", 100, 180, 120, 1, format="%d%%", key="s9_target") / 100.0
+    else:
+        channel_mapping = render_channel_controls(records) if scenario_id in (8, 9) else {}
+ 
     mapping = render_segment_controls(records)
-
+    params["channel_mapping"] = channel_mapping
+ 
     with sidebar.expander("Assumptions", expanded=False):
         st.caption(
             "Revenue basis: Net Sales only. "
@@ -3106,24 +3374,24 @@ def render_sidebar(records: pd.DataFrame) -> Tuple[int, Dict[str, Any], str, Dic
             "July-January 7 months, February-March 2 months."
         )
     basis = "NS"
-
+ 
     sidebar.markdown("<div class='app-rule'></div>", unsafe_allow_html=True)
     if sidebar.button("Use another workbook"):
         reset_workbook()
-
+ 
     return scenario_id, params, basis, mapping
-
-
+ 
+ 
 def render_segment_controls(records: pd.DataFrame) -> Dict[str, Any]:
     """Configurable segment classification for Scenario 6."""
     suggestions = identify_segments(records)
     mapping: Dict[str, Any] = dict(st.session_state.get("segment_mapping") or suggestions)
-
+ 
     usable_columns = [
         field for field in META_FIELDS
         if field in records.columns and text_column(records, field).ne("").any()
     ]
-
+ 
     with st.sidebar.expander("Segment mapping (Scenario 6)", expanded=False):
         st.caption(
             "Digital, Retail B30 and Others are derived from workbook metadata. "
@@ -3149,15 +3417,15 @@ def render_segment_controls(records: pd.DataFrame) -> Dict[str, Any]:
                 mapping[segment] = {"column": column, "values": list(chosen)}
             else:
                 mapping.pop(segment, None)
-
+ 
     st.session_state["segment_mapping"] = mapping
     return mapping
-
-
+ 
+ 
 # =============================================================================
 # 15. DASHBOARD SECTIONS
 # =============================================================================
-
+ 
 def render_baseline(model: ScenarioModel) -> None:
     section("Current Baseline")
     cards = []
@@ -3181,12 +3449,12 @@ def render_baseline(model: ScenarioModel) -> None:
         "It never changes with the selected scenario.</div>",
         unsafe_allow_html=True,
     )
-
-
+ 
+ 
 def scenario_cards(model: ScenarioModel, basis: str) -> List[Tuple]:
     kind = model.meta["kind"]
     cards: List[Tuple] = []
-
+ 
     if model.scenario_id == 6:
         for segment in model.available_segments():
             cell = model.cell(basis, segment=segment)
@@ -3206,7 +3474,7 @@ def scenario_cards(model: ScenarioModel, basis: str) -> List[Tuple]:
             fmt_cr_signed(overall["incremental_sales"]),
         ))
         return cards
-
+ 
     if model.scenario_id == 7:
         cell = model.cell(basis)
         momentum = cell["momentum_g"]
@@ -3234,7 +3502,7 @@ def scenario_cards(model: ScenarioModel, basis: str) -> List[Tuple]:
             fmt_pct_signed(cell["rr_change_pct"]) if cell["rr_change_pct"] is not None else None,
         ))
         return cards
-
+ 
     for sales in SALES_TYPES:
         cell = model.cell(sales)
         label = "Scenario Run Rate" if kind == "runrate" else "Required Run Rate"
@@ -3242,7 +3510,7 @@ def scenario_cards(model: ScenarioModel, basis: str) -> List[Tuple]:
             f"{sales} {label}", fmt_cr(cell["scen_rr"]),
             fmt_pct_signed(cell["rr_change_pct"]) if cell["rr_change_pct"] is not None else None,
         ))
-
+ 
     if kind == "jan_target":
         for sales in SALES_TYPES:
             cell = model.cell(sales)
@@ -3258,8 +3526,8 @@ def scenario_cards(model: ScenarioModel, basis: str) -> List[Tuple]:
         )
         cards.append((f"{sales} March Achievement", fmt_pct(cell["march_pct"]), delta))
     return cards
-
-
+ 
+ 
 def render_comparison(model: ScenarioModel, basis: str) -> None:
     section(f"Current vs Scenario {model.scenario_id} · {model.meta['name']}")
     cards = scenario_cards(model, basis)
@@ -3268,7 +3536,7 @@ def render_comparison(model: ScenarioModel, basis: str) -> None:
     else:
         kpi_row(cards[:4])
         kpi_row(cards[4:8])
-
+ 
     if model.scenario_id in (2, 5):
         implied = model.implied_milestones(basis)
         st.markdown(
@@ -3289,8 +3557,8 @@ def render_comparison(model: ScenarioModel, basis: str) -> None:
             "required run rate.</div>",
             unsafe_allow_html=True,
         )
-
-
+ 
+ 
 def render_revenue_kpis(model: ScenarioModel, basis: str) -> Dict[str, Any]:
     section("Revenue / Earnings Impact")
     bundle = revenue_bundle(model, basis)
@@ -3312,8 +3580,8 @@ def render_revenue_kpis(model: ScenarioModel, basis: str) -> Dict[str, Any]:
         unsafe_allow_html=True,
     )
     return bundle
-
-
+ 
+ 
 def render_detail_expander(model: ScenarioModel) -> None:
     with st.expander("Detailed baseline and comparison numbers", expanded=False):
         st.markdown("**Current baseline**")
@@ -3322,16 +3590,16 @@ def render_detail_expander(model: ScenarioModel) -> None:
         st.markdown("**Current vs selected scenario**")
         frame, formats = build_comparison(model)
         show_table(frame, formats)
-
-
+ 
+ 
 def render_vertical_section(model: ScenarioModel) -> None:
     section("Channel Drill-Down")
-
+ 
     available = model.available_verticals()
     if not available:
         st.info("No Retail / DHNI / VRM channel data is available.")
         return
-
+ 
     selected_vertical = st.selectbox(
         "Select Channel",
         available,
@@ -3339,10 +3607,10 @@ def render_vertical_section(model: ScenarioModel) -> None:
         key="channel_drilldown",
         help="Choose Retail, DHNI or VRM to inspect the selected scenario.",
     )
-
+ 
     frame, formats = build_vertical_summary(model)
     filtered = frame.loc[frame["Vertical"] == selected_vertical].copy()
-
+ 
     tabs = st.tabs([SALES_LABEL["GS"], SALES_LABEL["NS"]])
     for tab, sales in zip(tabs, SALES_TYPES):
         with tab:
@@ -3352,17 +3620,17 @@ def render_vertical_section(model: ScenarioModel) -> None:
                 show_table(sales_frame, formats)
             else:
                 st.info(f"No {SALES_LABEL[sales]} data for {selected_vertical}.")
-
+ 
     st.markdown(
         "<div class='note'>Choose one channel at a time for a cleaner management view. "
         "Gross Sales and Net Sales remain alternative revenue bases and are never added together.</div>",
         unsafe_allow_html=True,
     )
-
-
+ 
+ 
 def render_asset_section(model: ScenarioModel) -> None:
     section("Asset Class Drill-Down")
-
+ 
     selected_asset = st.selectbox(
         "Select Asset Class",
         ASSETS,
@@ -3370,7 +3638,7 @@ def render_asset_section(model: ScenarioModel) -> None:
         key="asset_class_drilldown",
         help="Choose Equity, Debt or Liquid to compare that asset across channels.",
     )
-
+ 
     tabs = st.tabs([SALES_LABEL["GS"], SALES_LABEL["NS"]])
     for tab, sales in zip(tabs, SALES_TYPES):
         with tab:
@@ -3381,8 +3649,8 @@ def render_asset_section(model: ScenarioModel) -> None:
                 show_table(filtered, formats)
             else:
                 st.info(f"No {SALES_LABEL[sales]} data for {selected_asset}.")
-
-
+ 
+ 
 def render_segment_section(model: ScenarioModel, basis: str, counts: Dict[str, int]) -> None:
     section("Scenario 6 · Segment Analysis")
     unmapped = [s for s in ("Digital", "Retail B30") if counts.get(s, 0) == 0]
@@ -3397,19 +3665,19 @@ def render_segment_section(model: ScenarioModel, basis: str, counts: Dict[str, i
             "the correct column and values.",
             tone="warn",
         )
-
+ 
     present = " · ".join(
         f"{segment} {S6_SEGMENT_TARGETS[segment]:.0%} of FY target ({counts.get(segment, 0)} RMs)"
         for segment in SEGMENT_ORDER
     )
     st.markdown(f"<div class='note'>Scenario assumption — {present}.</div>", unsafe_allow_html=True)
-
+ 
     tabs = st.tabs([SALES_LABEL["GS"], SALES_LABEL["NS"]])
     for tab, sales in zip(tabs, SALES_TYPES):
         with tab:
             frame, formats = build_segment_scenario_analysis(model, sales)
             show_table(frame, formats)
-
+ 
     overall = model.cell(basis)
     lines = []
     for segment in model.available_segments():
@@ -3427,13 +3695,13 @@ def render_segment_section(model: ScenarioModel, basis: str, counts: Dict[str, i
         f"{fmt_pct(overall['current_march_pct'])} to {fmt_pct(overall['march_pct'])}, an improvement "
         f"of {fmt_cr_signed(overall['incremental_sales'])}."
     )
-
-
+ 
+ 
 def render_momentum_section(model: ScenarioModel, basis: str) -> None:
     section("Scenario 7 · Momentum Analysis")
     cell = model.cell(basis)
     momentum = cell["momentum_g"]
-
+ 
     kpi_row([
         ("Current Run Rate", fmt_cr(cell["current_rr"]), f"Apr-Jun, {SALES_LABEL[basis]}", "off"),
         ("Required MoM Momentum", fmt_pct(momentum) if momentum is not None else NA_TEXT,
@@ -3451,7 +3719,7 @@ def render_momentum_section(model: ScenarioModel, basis: str) -> None:
         ("March Headroom / Shortfall", fmt_cr_signed(cell["headroom_amt"]),
          fmt_pts(cell["headroom_pct"]) if cell["headroom_pct"] is not None else None),
     ])
-
+ 
     if cell["feasible"]:
         callout(
             "<span class='tag-ok'>✓ TARGET ACHIEVABLE</span> — the momentum trajectory reaches the "
@@ -3468,7 +3736,7 @@ def render_momentum_section(model: ScenarioModel, basis: str) -> None:
         )
     if cell.get("note"):
         st.markdown(f"<div class='note'>{cell['note']}</div>", unsafe_allow_html=True)
-
+ 
     momentum_text = fmt_pct(momentum) if momentum is not None else "a flat required"
     outcome = (
         f"{fmt_pct(cell['headroom_pct'])} headroom" if _z(cell["headroom_amt"]) >= 0
@@ -3484,11 +3752,11 @@ def render_momentum_section(model: ScenarioModel, basis: str) -> None:
         f"{fmt_pct(model.params['mar_target'])} ambition, creating {outcome}. "
         f"January buffer created before leakage: {fmt_cr_signed(cell['jan_buffer'])}."
     )
-
+ 
     st.markdown("**Monthly momentum trajectory**")
     frame, formats = build_momentum_analysis(cell)
     show_table(frame, formats)
-
+ 
     trajectory = cell.get("trajectory") or []
     if trajectory:
         chart = pd.DataFrame(
@@ -3506,7 +3774,7 @@ def render_momentum_section(model: ScenarioModel, basis: str) -> None:
             f"{fmt_pct(cell.get('leakage'))} each.</div>",
             unsafe_allow_html=True,
         )
-
+ 
     tabs = st.tabs(["Asset class", "Retail / DHNI / VRM", "Leakage sensitivity", "Monthly revenue"])
     with tabs[0]:
         for sales in SALES_TYPES:
@@ -3539,13 +3807,13 @@ def render_momentum_section(model: ScenarioModel, basis: str) -> None:
             f"{fmt_cr_signed(march_revenue['total'] - baseline['total'], 1)}.</div>",
             unsafe_allow_html=True,
         )
-
-
+ 
+ 
 def render_revenue_detail(model: ScenarioModel, basis: str, bundle: Dict[str, Any]) -> None:
     section("Revenue by Asset Class")
     frame, formats = build_revenue_impact(model, basis)
     show_table(frame, formats)
-
+ 
     incremental = bundle["incremental"]
     parts = " + ".join(
         f"{asset} {fmt_cr_signed(incremental['by_asset'][asset], 1)}" for asset in ASSETS
@@ -3558,8 +3826,8 @@ def render_revenue_detail(model: ScenarioModel, basis: str, bundle: Dict[str, An
         f"+ {parts} = scenario revenue {fmt_cr(bundle['scenario']['total'], 1)}.<br>"
         f"<b>Scenario revenue contribution:</b> {contribution}."
     )
-
-
+ 
+ 
 def render_export(model: ScenarioModel, basis: str) -> None:
     section("Export")
     try:
@@ -3579,12 +3847,12 @@ def render_export(model: ScenarioModel, basis: str) -> None:
         "Scenario 7 momentum analysis and Scenario 7 monthly revenue.</div>",
         unsafe_allow_html=True,
     )
-
-
+ 
+ 
 # =============================================================================
 # 15A. RM PERFORMANCE SEGMENTATION PAGE
 # =============================================================================
-
+ 
 ACHIEVEMENT_BANDS: List[Tuple[str, float, Optional[float]]] = [
     ("100% and above", 1.00, None),
     ("90% - 100%", 0.90, 1.00),
@@ -3594,14 +3862,14 @@ ACHIEVEMENT_BANDS: List[Tuple[str, float, Optional[float]]] = [
     ("Less than 30%", float("-inf"), 0.30),
 ]
 ACHIEVEMENT_BAND_ORDER: List[str] = [item[0] for item in ACHIEVEMENT_BANDS]
-
-
+ 
+ 
 def achievement_band(value: Any) -> str:
     """Map YTD-target achievement to the management bands requested for RMs."""
     ratio = _num(value)
     # User requested N/A to be treated/displayed as 0.
     ratio = 0.0 if ratio is None else ratio
-
+ 
     if ratio >= 1.00:
         return "100% and above"
     if ratio >= 0.90:
@@ -3613,16 +3881,16 @@ def achievement_band(value: Any) -> str:
     if ratio >= 0.30:
         return "30% - 50%"
     return "Less than 30%"
-
-
+ 
+ 
 def _rm_identity_columns(records: pd.DataFrame) -> List[str]:
     preferred = [
         "Employee Name", "Emp Code", "ADID", "ZONE", "REGION",
         "EM City", "MKT TYPE", "Type", "Status",
     ]
     return [column for column in preferred if column in records.columns]
-
-
+ 
+ 
 def build_rm_performance_detail(
     records: pd.DataFrame,
     vertical: str,
@@ -3631,7 +3899,7 @@ def build_rm_performance_detail(
 ) -> pd.DataFrame:
     """
     Build one row per RM.
-
+ 
     Banding is based on overall YTD achievement / overall YTD target across
     Equity + Debt + Liquid. Run-rate projection annualises the first three
     completed months.
@@ -3639,33 +3907,33 @@ def build_rm_performance_detail(
     subset = records.loc[records["Vertical"] == vertical].copy()
     if subset.empty:
         return pd.DataFrame()
-
+ 
     identity = _rm_identity_columns(subset)
     out = subset[identity].copy()
-
+ 
     fy_cols = [f"{sales}_{asset}_fy" for asset in ASSETS]
     ytd_target_cols = [f"{sales}_{asset}_ytd_tgt" for asset in ASSETS]
     ach_cols = [f"{sales}_{asset}_ach" for asset in ASSETS]
-
+ 
     for columns in (fy_cols, ytd_target_cols, ach_cols):
         for column in columns:
             if column not in subset.columns:
                 subset[column] = 0.0
-
+ 
     fy_matrix = subset[fy_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
     ytd_target_matrix = subset[ytd_target_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
     ach_matrix = subset[ach_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
-
+ 
     out["FY Target"] = fy_matrix.sum(axis=1)
     out["YTD Target"] = ytd_target_matrix.sum(axis=1)
     out["YTD Achievement"] = ach_matrix.sum(axis=1)
-
+ 
     out["YTD Achievement %"] = np.where(
         out["YTD Target"] > 0,
         out["YTD Achievement"] / out["YTD Target"],
         0.0,
     )
-
+ 
     out["Achievement Category"] = out["YTD Achievement %"].map(achievement_band)
     out["Current Run Rate"] = out["YTD Achievement"] / max(MONTHS_COMPLETED, 1)
     out["Estimated FY @ Current RR"] = out["Current Run Rate"] * 12.0
@@ -3674,17 +3942,17 @@ def build_rm_performance_detail(
         out["Estimated FY @ Current RR"] / out["FY Target"],
         0.0,
     )
-
+ 
     denominator = _num(final_target)
     if denominator is None or denominator <= 0:
         denominator = _num(out["FY Target"].sum()) or 0.0
-
+ 
     out["Contribution to Overall Target %"] = np.where(
         denominator > 0,
         out["Estimated FY @ Current RR"] / denominator,
         0.0,
     )
-
+ 
     # Asset-level achieved percentages are useful when drilling into an RM.
     for asset in ASSETS:
         fy = pd.to_numeric(subset[f"{sales}_{asset}_fy"], errors="coerce").fillna(0.0)
@@ -3692,7 +3960,7 @@ def build_rm_performance_detail(
             subset[f"{sales}_{asset}_ytd_tgt"], errors="coerce"
         ).fillna(0.0)
         ach = pd.to_numeric(subset[f"{sales}_{asset}_ach"], errors="coerce").fillna(0.0)
-
+ 
         out[f"{asset} YTD %"] = np.where(ytd_target > 0, ach / ytd_target, 0.0)
         out[f"{asset} Current RR"] = ach / max(MONTHS_COMPLETED, 1)
         out[f"{asset} Projected FY %"] = np.where(
@@ -3700,15 +3968,15 @@ def build_rm_performance_detail(
             (ach / max(MONTHS_COMPLETED, 1) * 12.0) / fy,
             0.0,
         )
-
+ 
     out = out.sort_values(
         ["YTD Achievement %", "YTD Achievement"],
         ascending=[False, False],
     ).reset_index(drop=True)
-
+ 
     return out
-
-
+ 
+ 
 def build_category_contribution(
     detail: pd.DataFrame,
     final_target: Optional[float] = None,
@@ -3719,13 +3987,13 @@ def build_category_contribution(
     """
     if detail.empty:
         return pd.DataFrame()
-
+ 
     target_denominator = _num(final_target)
     if target_denominator is None or target_denominator <= 0:
         target_denominator = _num(detail["FY Target"].sum()) or 0.0
-
+ 
     total_projected = _num(detail["Estimated FY @ Current RR"].sum()) or 0.0
-
+ 
     grouped = (
         detail.groupby("Achievement Category", dropna=False)
         .agg(
@@ -3741,7 +4009,7 @@ def build_category_contribution(
         .reindex(ACHIEVEMENT_BAND_ORDER, fill_value=0)
         .reset_index()
     )
-
+ 
     grouped["Current YTD Achievement %"] = np.where(
         grouped["YTD Target"] > 0,
         grouped["YTD Achievement"] / grouped["YTD Target"],
@@ -3762,10 +4030,10 @@ def build_category_contribution(
         grouped["Estimated FY @ Current RR"] / total_projected,
         0.0,
     )
-
+ 
     return grouped
-
-
+ 
+ 
 def _final_vertical_target(
     final_metrics: Dict[str, Any],
     sales: str,
@@ -3775,8 +4043,8 @@ def _final_vertical_target(
     if not isinstance(frame, pd.DataFrame) or frame.empty or vertical not in frame.index:
         return None
     return _num(frame.loc[vertical].get("FY27 Target"))
-
-
+ 
+ 
 def _final_vertical_ytd(
     final_metrics: Dict[str, Any],
     sales: str,
@@ -3786,8 +4054,8 @@ def _final_vertical_ytd(
     if not isinstance(frame, pd.DataFrame) or frame.empty or vertical not in frame.index:
         return None
     return _num(frame.loc[vertical].get("YTD"))
-
-
+ 
+ 
 def _gold_star_card(rank: int, row: pd.Series) -> str:
     name = escape(str(row.get("Employee Name", "RM")))
     achievement = fmt_pct(row.get("YTD Achievement %"))
@@ -3805,28 +4073,28 @@ def _gold_star_card(rank: int, row: pd.Series) -> str:
         f"Overall-target contribution: <b>{contribution}</b>"
         "</div></div>"
     )
-
-
+ 
+ 
 def render_stars_of_month(detail: pd.DataFrame, vertical: str, sales: str) -> None:
     section("Stars of the Month")
-
+ 
     if detail.empty:
         st.info("No RM data is available for the selected view.")
         return
-
+ 
     # Workbook provides YTD/current-run-rate fields, not a standalone single-month
     # achievement column. Rank by YTD achievement % and then YTD achievement amount.
     ranked = detail.sort_values(
         ["YTD Achievement %", "YTD Achievement"],
         ascending=[False, False],
     ).reset_index(drop=True)
-
+ 
     top = ranked.head(3)
     columns = st.columns(max(len(top), 1))
     for index, (_, row) in enumerate(top.iterrows(), start=1):
         with columns[index - 1]:
             st.markdown(_gold_star_card(index, row), unsafe_allow_html=True)
-
+ 
     st.markdown(
         "<div class='note'>Stars are ranked from the performance fields available in the "
         "uploaded scorecard: overall YTD achievement versus YTD target, with YTD achievement "
@@ -3834,7 +4102,7 @@ def render_stars_of_month(detail: pd.DataFrame, vertical: str, sales: str) -> No
         "the app does not invent a separate monthly score.</div>",
         unsafe_allow_html=True,
     )
-
+ 
     top_table = ranked.head(10).copy()
     columns_to_show = [
         column
@@ -3860,8 +4128,8 @@ def render_stars_of_month(detail: pd.DataFrame, vertical: str, sales: str) -> No
             "Contribution to Overall Target %": "pct",
         },
     )
-
-
+ 
+ 
 def render_rm_sales_segmentation(
     records: pd.DataFrame,
     final_metrics: Dict[str, Any],
@@ -3870,7 +4138,7 @@ def render_rm_sales_segmentation(
 ) -> None:
     final_target = _final_vertical_target(final_metrics, sales, vertical)
     final_ytd = _final_vertical_ytd(final_metrics, sales, vertical)
-
+ 
     detail = build_rm_performance_detail(
         records,
         vertical=vertical,
@@ -3880,14 +4148,14 @@ def render_rm_sales_segmentation(
     if detail.empty:
         st.info(f"No RM records are available for {vertical} · {SALES_LABEL[sales]}.")
         return
-
+ 
     contribution = build_category_contribution(detail, final_target=final_target)
-
+ 
     projected_total = _num(detail["Estimated FY @ Current RR"].sum()) or 0.0
     ytd_total = _num(detail["YTD Achievement"].sum()) or 0.0
     ytd_target_total = _num(detail["YTD Target"].sum()) or 0.0
     rm_count = len(detail)
-
+ 
     ytd_pct = ytd_total / ytd_target_total if ytd_target_total > 0 else 0.0
     projected_pct = (
         projected_total / final_target
@@ -3896,13 +4164,13 @@ def render_rm_sales_segmentation(
             projected_total / (_num(detail["FY Target"].sum()) or 1.0)
         )
     )
-
+ 
     high_performers = int(
         detail["Achievement Category"]
         .isin(["100% and above", "90% - 100%"])
         .sum()
     )
-
+ 
     kpi_row([
         ("Total RMs", fmt_num(rm_count), f"{vertical} · {SALES_LABEL[sales]}", "off"),
         ("YTD Achievement vs YTD Target", fmt_pct(ytd_pct),
@@ -3914,9 +4182,9 @@ def render_rm_sales_segmentation(
         ("FINAL FY27 Target", fmt_cr(final_target),
          "management target", "off"),
     ])
-
+ 
     section("RM Achievement Segmentation")
-
+ 
     count_map = dict(
         zip(
             contribution["Achievement Category"],
@@ -3936,14 +4204,14 @@ def render_rm_sales_segmentation(
     # Keep six bands readable by using two rows.
     kpi_row(count_cards[:3])
     kpi_row(count_cards[3:])
-
+ 
     count_chart = (
         contribution[["Achievement Category", "RM Count"]]
         .set_index("Achievement Category")
         .reindex(ACHIEVEMENT_BAND_ORDER)
     )
     st.bar_chart(count_chart)
-
+ 
     section("Category Run-Rate Contribution to Overall Target")
     st.markdown(
         "<div class='note'>Each category's RMs are annualised at their current run rate. "
@@ -3953,7 +4221,7 @@ def render_rm_sales_segmentation(
         "target achievement if its current pace continues.</div>",
         unsafe_allow_html=True,
     )
-
+ 
     contribution_display = contribution.copy()
     show_table(
         contribution_display,
@@ -3971,7 +4239,7 @@ def render_rm_sales_segmentation(
             "Share of Projected Sales %": "pct",
         },
     )
-
+ 
     contribution_chart = contribution[
         ["Achievement Category", "Contribution to Overall Target %"]
     ].copy()
@@ -3980,7 +4248,7 @@ def render_rm_sales_segmentation(
         ACHIEVEMENT_BAND_ORDER
     )
     st.bar_chart(contribution_chart)
-
+ 
     total_contribution = _num(
         contribution["Contribution to Overall Target %"].sum()
     ) or 0.0
@@ -3997,7 +4265,7 @@ def render_rm_sales_segmentation(
         + "</div>",
         unsafe_allow_html=True,
     )
-
+ 
     section("RM Drill-Down by Achievement Category")
     selected_band = st.selectbox(
         "Achievement Category",
@@ -4005,7 +4273,7 @@ def render_rm_sales_segmentation(
         index=0,
         key=f"rm_band_{vertical}_{sales}",
     )
-
+ 
     rm_rows = detail.loc[detail["Achievement Category"] == selected_band].copy()
     if rm_rows.empty:
         st.info(f"No RMs fall in {selected_band} for this selection.")
@@ -4044,17 +4312,17 @@ def render_rm_sales_segmentation(
                 "Liquid YTD %": "pct",
             },
         )
-
+ 
     render_stars_of_month(detail, vertical, sales)
-
-
+ 
+ 
 def make_rm_segmentation_export(
     records: pd.DataFrame,
     final_metrics: Dict[str, Any],
 ) -> bytes:
     """Downloadable workbook covering every vertical and both sales bases."""
     output = io.BytesIO()
-
+ 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         for vertical in VERTICALS:
             for sales in SALES_TYPES:
@@ -4071,7 +4339,7 @@ def make_rm_segmentation_export(
                     .head(10)
                     .copy()
                 )
-
+ 
                 prefix = f"{vertical}-{sales}"
                 detail.to_excel(
                     writer,
@@ -4088,7 +4356,7 @@ def make_rm_segmentation_export(
                     sheet_name=f"{prefix}-Stars"[:31],
                     index=False,
                 )
-
+ 
         for ws in writer.book.worksheets:
             ws.freeze_panes = "A2"
             for cell in ws[1]:
@@ -4102,12 +4370,12 @@ def make_rm_segmentation_export(
                     max(width + 2, 12),
                     36,
                 )
-
+ 
     output.seek(0)
     return output.getvalue()
-
-
-
+ 
+ 
+ 
 def _clean_filter_values(series: pd.Series) -> List[str]:
     """Return sorted non-empty values for RM filter dropdowns."""
     cleaned = (
@@ -4121,8 +4389,8 @@ def _clean_filter_values(series: pd.Series) -> List[str]:
         & cleaned.str.lower().ne("none")
     ]
     return sorted(cleaned.drop_duplicates().tolist(), key=lambda value: value.lower())
-
-
+ 
+ 
 def _apply_exact_text_filter(
     frame: pd.DataFrame,
     column: str,
@@ -4131,7 +4399,7 @@ def _apply_exact_text_filter(
     """Apply one exact dropdown filter while treating 'All' as no filter."""
     if selected == "All" or column not in frame.columns:
         return frame
-
+ 
     values = (
         frame[column]
         .astype(str)
@@ -4139,41 +4407,41 @@ def _apply_exact_text_filter(
         .str.strip()
     )
     return frame.loc[values == selected].copy()
-
-
+ 
+ 
 def render_retail_rm_filters(records: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]]:
     """
     Cascading Retail-only filters for the second page.
-
+ 
     Filter order:
       ZONE -> REGION -> MKT TYPE
-
+ 
     The returned dataframe keeps DHNI/VRM untouched and replaces only Retail
     rows with the filtered Retail population. This means the same dataframe can
     safely be used by the page and by the downloadable workbook.
     """
     retail = records.loc[records["Vertical"] == "Retail"].copy()
-
+ 
     selections: Dict[str, str] = {
         "ZONE": "All",
         "REGION": "All",
         "MKT TYPE": "All",
     }
-
+ 
     st.markdown(
         "<div class='subsection-title'>Retail RM Filters</div>",
         unsafe_allow_html=True,
     )
-
+ 
     filter_cols = st.columns(3)
-
+ 
     # -------------------------
     # ZONE
     # -------------------------
     zone_options = ["All"]
     if "ZONE" in retail.columns:
         zone_options += _clean_filter_values(retail["ZONE"])
-
+ 
     with filter_cols[0]:
         selections["ZONE"] = st.selectbox(
             "ZONE",
@@ -4182,20 +4450,20 @@ def render_retail_rm_filters(records: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[
             key="retail_rm_zone_filter",
             help="Filter Retail RMs by zone.",
         )
-
+ 
     filtered_retail = _apply_exact_text_filter(
         retail,
         "ZONE",
         selections["ZONE"],
     )
-
+ 
     # -------------------------
     # REGION — cascades from ZONE
     # -------------------------
     region_options = ["All"]
     if "REGION" in filtered_retail.columns:
         region_options += _clean_filter_values(filtered_retail["REGION"])
-
+ 
     with filter_cols[1]:
         selections["REGION"] = st.selectbox(
             "REGION",
@@ -4204,20 +4472,20 @@ def render_retail_rm_filters(records: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[
             key=f"retail_rm_region_filter_{selections['ZONE']}",
             help="Region options automatically narrow after selecting a zone.",
         )
-
+ 
     filtered_retail = _apply_exact_text_filter(
         filtered_retail,
         "REGION",
         selections["REGION"],
     )
-
+ 
     # -------------------------
     # MKT TYPE — cascades from ZONE + REGION
     # -------------------------
     market_options = ["All"]
     if "MKT TYPE" in filtered_retail.columns:
         market_options += _clean_filter_values(filtered_retail["MKT TYPE"])
-
+ 
     with filter_cols[2]:
         selections["MKT TYPE"] = st.selectbox(
             "MKT TYPE",
@@ -4229,13 +4497,13 @@ def render_retail_rm_filters(records: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[
             ),
             help="Market Type options narrow after the selected zone and region.",
         )
-
+ 
     filtered_retail = _apply_exact_text_filter(
         filtered_retail,
         "MKT TYPE",
         selections["MKT TYPE"],
     )
-
+ 
     # Keep all non-Retail rows unchanged. Replace Retail with the selected slice.
     non_retail = records.loc[records["Vertical"] != "Retail"].copy()
     filtered_records = pd.concat(
@@ -4243,15 +4511,15 @@ def render_retail_rm_filters(records: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[
         ignore_index=True,
         sort=False,
     )
-
+ 
     active_filters = [
         f"{column}: {value}"
         for column, value in selections.items()
         if value != "All"
     ]
-
+ 
     active_text = " · ".join(active_filters) if active_filters else "All Retail RMs"
-
+ 
     st.markdown(
         "<div class='callout'>"
         f"<b>Retail population:</b> {len(filtered_retail):,} RM(s)<br>"
@@ -4259,15 +4527,15 @@ def render_retail_rm_filters(records: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[
         "</div>",
         unsafe_allow_html=True,
     )
-
+ 
     return filtered_records, selections
-
-
-
+ 
+ 
+ 
 def render_rm_segmentation_page(records: pd.DataFrame, payload: bytes) -> None:
     """Second application page dedicated to RM achievement segmentation."""
     final_metrics = parse_final_dashboard_metrics(payload)
-
+ 
     st.markdown(
         "<div class='app-title'>RM Performance Segmentation & Contribution Analysis</div>",
         unsafe_allow_html=True,
@@ -4278,7 +4546,7 @@ def render_rm_segmentation_page(records: pd.DataFrame, payload: bytes) -> None:
         unsafe_allow_html=True,
     )
     st.markdown("<div class='app-rule'></div>", unsafe_allow_html=True)
-
+ 
     st.markdown(
         "<span class='category-pill'>100% and above</span>"
         "<span class='category-pill'>90% - 100%</span>"
@@ -4288,7 +4556,7 @@ def render_rm_segmentation_page(records: pd.DataFrame, payload: bytes) -> None:
         "<span class='category-pill'>Less than 30%</span>",
         unsafe_allow_html=True,
     )
-
+ 
     vertical = st.selectbox(
         "Select RM Channel",
         VERTICALS,
@@ -4296,19 +4564,19 @@ def render_rm_segmentation_page(records: pd.DataFrame, payload: bytes) -> None:
         key="rm_seg_vertical",
         help="Switch between Retail, DHNI and VRM.",
     )
-
+ 
     page_records = records
     retail_filter_selections: Dict[str, str] = {
         "ZONE": "All",
         "REGION": "All",
         "MKT TYPE": "All",
     }
-
+ 
     # Retail gets the requested extra management filters.
     # DHNI and VRM continue to use their full populations.
     if vertical == "Retail":
         page_records, retail_filter_selections = render_retail_rm_filters(records)
-
+ 
     tabs = st.tabs([SALES_LABEL["GS"], SALES_LABEL["NS"]])
     for tab, sales in zip(tabs, SALES_TYPES):
         with tab:
@@ -4318,7 +4586,7 @@ def render_rm_segmentation_page(records: pd.DataFrame, payload: bytes) -> None:
                 vertical,
                 sales,
             )
-
+ 
     section("Download RM Segmentation Analysis")
     try:
         export_payload = make_rm_segmentation_export(page_records, final_metrics)
@@ -4341,14 +4609,14 @@ def render_rm_segmentation_page(records: pd.DataFrame, payload: bytes) -> None:
             )
     except Exception:
         st.warning("The RM segmentation export could not be generated.")
-
+ 
     st.markdown(
         "<div class='note'>Missing / undefined numeric outputs are displayed as 0, "
         "as requested.</div>",
         unsafe_allow_html=True,
     )
-
-
+ 
+ 
 def render_page_navigation() -> str:
     st.sidebar.markdown(
         "<div class='sidebar-title'>Application Page</div>",
@@ -4366,22 +4634,66 @@ def render_page_navigation() -> str:
     )
     st.sidebar.markdown("<div class='app-rule'></div>", unsafe_allow_html=True)
     return page
-
-
-
+ 
+ 
+ 
 # =============================================================================
 # 16. APPLICATION ENTRY POINT
 # =============================================================================
-
+ 
+def render_channel_simulator(model: ScenarioModel, basis: str) -> None:
+    section("Scenario 8 · Channel Growth & Target Simulator")
+    frame, formats = build_channel_scenario_analysis(model, basis)
+    if frame.empty:
+        callout("No mapped channel data is available. Use Channel mapping in the sidebar to classify the workbook.", tone="warn")
+        return
+    st.markdown("<div class='channel-simulator-note'>Nine independent management levers · MoM growth · January 2027 target · March 2027 target · 20% default leakage</div>", unsafe_allow_html=True)
+    show_table(frame, formats)
+    jan_gap = frame["Jan Gap / Headroom"].sum()
+    mar_gap = frame["Mar Gap / Headroom"].sum()
+    total_incremental = frame["March Incremental Sales"].sum()
+    kpi_row([
+        ("January Portfolio Headroom", fmt_cr_signed(jan_gap), "positive = above target"),
+        ("March Portfolio Headroom", fmt_cr_signed(mar_gap), "positive = above target"),
+        ("Incremental March Sales", fmt_cr_signed(total_incremental), "vs current projection"),
+        ("Channels", f"{len(frame)} / {len(CHANNELS)}", "mapped into simulator", "off"),
+    ])
+    if (frame["Jan Gap / Headroom"] >= 0).all() and (frame["Mar Gap / Headroom"] >= 0).all():
+        callout("<span class='tag-ok'>✓ ALL CHANNELS ON TRACK</span> — selected growth assumptions clear both January and March targets after leakage.", tone="ok")
+    else:
+        misses = frame.loc[(frame["Jan Gap / Headroom"] < 0) | (frame["Mar Gap / Headroom"] < 0), "Channel"].tolist()
+        callout("<span class='tag-warn'>⚠ CHANNEL GAP</span> — review: " + ", ".join(misses) + ". Increase MoM growth or adjust the relevant target.", tone="warn")
+ 
+ 
+def render_channel_optimizer(model: ScenarioModel, basis: str) -> None:
+    section("Scenario 9 · Channel Mix Optimiser")
+    target = float(model.params.get("optimizer_target", 1.20))
+    frame, formats = build_channel_scenario_analysis(model, basis)
+    if frame.empty:
+        st.info("No mapped channel data is available.")
+        return
+    # Scenario 9 grid already solves each channel against the target controls; expose the
+    # optimiser as a management view and keep the target visible as the portfolio ambition.
+    frame = frame.copy()
+    frame["Optimised MoM"] = frame["MoM Growth"]
+    frame["Portfolio Ambition"] = target
+    formats = dict(formats); formats.update({"Optimised MoM":"pct_signed", "Portfolio Ambition":"pct"})
+    show_table(frame, formats)
+    weighted = model.cell(basis)
+    callout(f"The optimiser is solving the minimum momentum trajectory by channel while protecting the selected portfolio March ambition of {fmt_pct(target)} and the January milestone. Adjust channel mappings and targets in the sidebar to change the optimisation universe.")
+ 
+ 
 def render_dashboard(records: pd.DataFrame, payload: bytes) -> None:
     scenario_id, params, basis, mapping = render_sidebar(records)
     records = map_business_segments(records, mapping)
+    channel_mapping = params.get("channel_mapping") or st.session_state.get("channel_mapping") or {}
+    records = map_business_channels(records, channel_mapping)
     segment_counts = segment_diagnostics(records)
     grid = build_base_grid(records)
     model = ScenarioModel(scenario_id, grid, params)
-
+ 
     final_metrics = parse_final_dashboard_metrics(payload)
-
+ 
     st.markdown(f"<div class='app-title'>{APP_TITLE}</div>", unsafe_allow_html=True)
     st.markdown(
         "<div class='app-sub'>FINAL management metrics → selected scenario comparison → "
@@ -4389,7 +4701,7 @@ def render_dashboard(records: pd.DataFrame, payload: bytes) -> None:
         unsafe_allow_html=True,
     )
     st.markdown("<div class='app-rule'></div>", unsafe_allow_html=True)
-
+ 
     # Single-screen management flow:
     # 1. FINAL current metrics
     # 2. selected scenario against the same metrics
@@ -4397,20 +4709,24 @@ def render_dashboard(records: pd.DataFrame, payload: bytes) -> None:
     render_final_metric_baseline(final_metrics, model)
     render_final_scenario_comparison(final_metrics, model, basis)
     render_current_runrate_metric_grid(final_metrics, model)
-
+ 
     bundle = render_revenue_kpis(model, basis)
     render_detail_expander(model)
-
+ 
     render_vertical_section(model)
     render_asset_section(model)
-
+ 
     if scenario_id == 6:
         render_segment_section(model, basis, segment_counts)
     if scenario_id == 7:
         render_momentum_section(model, basis)
-
+    if scenario_id == 8:
+        render_channel_simulator(model, basis)
+    if scenario_id == 9:
+        render_channel_optimizer(model, basis)
+ 
     render_revenue_detail(model, basis, bundle)
-
+ 
     with st.expander("Source FINAL sheet", expanded=False):
         st.markdown(
             "<div class='note'>Reference view of the workbook's FINAL sheet. "
@@ -4418,26 +4734,26 @@ def render_dashboard(records: pd.DataFrame, payload: bytes) -> None:
             unsafe_allow_html=True,
         )
         st.markdown(build_final_sheet_html(payload), unsafe_allow_html=True)
-
+ 
     render_export(model, basis)
-
-
+ 
+ 
 def reset_workbook() -> None:
-    for key in ("workbook", "segment_mapping", "application_page_selector"):
+    for key in ("workbook", "segment_mapping", "channel_mapping", "application_page_selector"):
         st.session_state.pop(key, None)
     rerun()
-
-
+ 
+ 
 def main() -> None:
     st.set_page_config(
         page_title=APP_TITLE, page_icon="▮", layout="wide", initial_sidebar_state="expanded",
     )
     st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
-
+ 
     if "workbook" not in st.session_state:
         render_upload_screen()
         return
-
+ 
     try:
         records = load_workbook(st.session_state["workbook"])
     except WorkbookError as error:
@@ -4453,9 +4769,9 @@ def main() -> None:
         if st.button("Use another workbook"):
             reset_workbook()
         return
-
+ 
     page = render_page_navigation()
-
+ 
     try:
         if page == "RM Performance Segmentation":
             render_rm_segmentation_page(records, st.session_state["workbook"])
@@ -4469,7 +4785,7 @@ def main() -> None:
             "This view could not be prepared from the uploaded workbook. Please select another "
             "page/scenario, or upload a workbook that matches the standard RM scorecard format."
         )
-
-
+ 
+ 
 if __name__ == "__main__":
     main()

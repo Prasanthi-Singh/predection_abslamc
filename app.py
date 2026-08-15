@@ -4774,5 +4774,340 @@ def main() -> None:
         )
  
  
+# =============================================================================
+# 17. MANAGEMENT CUTS + ALL-SCENARIO VIEW (FINAL-aware)
+# =============================================================================
+
+LOCATION_FIELD_ALIASES = ["MKT TYPE", "MKT TYPE ", "Market Type", "Mkt Type"]
+
+def _location_column(records: pd.DataFrame) -> Optional[str]:
+    for c in LOCATION_FIELD_ALIASES:
+        if c in records.columns:
+            return c
+    return None
+
+def _location_options(records: pd.DataFrame, channel: str) -> List[str]:
+    col = _location_column(records)
+    if col is None:
+        return ["All"]
+    work = records
+    if channel != "All" and "Vertical" in work.columns:
+        work = work.loc[work["Vertical"] == channel]
+    vals = sorted({str(v).strip() for v in work[col].dropna().tolist() if str(v).strip()})
+    # Preserve the workbook's location/mkt-type cuts, including T2/T6/T30/B30/EM.
+    return ["All"] + vals
+
+def _apply_management_cuts(
+    records: pd.DataFrame,
+    channel: str,
+    location: str,
+) -> pd.DataFrame:
+    out = records.copy()
+    if channel != "All" and "Vertical" in out.columns:
+        out = out.loc[out["Vertical"] == channel].copy()
+    col = _location_column(out)
+    if location != "All" and col is not None:
+        out = out.loc[out[col].astype(str).str.strip() == location].copy()
+    return out
+
+def render_management_cut_controls(records: pd.DataFrame) -> Tuple[str, str, str, str, pd.DataFrame]:
+    """
+    Four explicit management cuts:
+      1) Gross Sales / Net Sales
+      2) Channel: Retail / DHNI / VRM
+      3) Asset Class: Equity / Debt / Liquid
+      4) Location / Market Type: T2 / T6 / T30 / B30 / EM / workbook values
+
+    The first three are visualization cuts. Channel + location are applied to
+    the calculation grid so scenario mathematics is recalculated on the exact
+    selected population.
+    """
+    section("Management Cuts")
+    st.markdown(
+        "<div class='note'>All scenario calculations below are recalculated on the "
+        "selected Channel + Location population. Gross/Net Sales and Asset Class "
+        "control the visualised metric without changing the underlying workbook data.</div>",
+        unsafe_allow_html=True,
+    )
+    c1, c2, c3, c4 = st.columns(4)
+
+    with c1:
+        sales = st.selectbox(
+            "Sales",
+            ["Gross Sales", "Net Sales"],
+            index=0,
+            key="mgmt_sales_cut",
+        )
+    with c2:
+        channel_options = ["All"] + [v for v in VERTICALS if v in set(records.get("Vertical", pd.Series(dtype=str)).astype(str))]
+        channel = st.selectbox(
+            "Channel",
+            channel_options,
+            index=0,
+            key="mgmt_channel_cut",
+        )
+    with c3:
+        asset = st.selectbox(
+            "Asset Class",
+            ["All", *ASSETS],
+            index=0,
+            key="mgmt_asset_cut",
+        )
+    with c4:
+        loc_options = _location_options(records, channel)
+        current_loc = st.session_state.get("mgmt_location_cut", "All")
+        loc_index = loc_options.index(current_loc) if current_loc in loc_options else 0
+        location = st.selectbox(
+            "Location / Market Type",
+            loc_options,
+            index=loc_index,
+            key="mgmt_location_cut",
+        )
+
+    filtered = _apply_management_cuts(records, channel, location)
+    if filtered.empty:
+        st.warning("No employee records match the selected Channel + Location cut.")
+    return sales, channel, asset, location, filtered
+
+def _scenario_default_params(scenario_id: int) -> Dict[str, Any]:
+    """Defaults exactly from the existing scenario engine configuration."""
+    return {
+        "dip": S3_DEFAULT_DIP,
+        "jan_target": S7_DEFAULT_JAN_TARGET,
+        "mar_target": S7_DEFAULT_MAR_TARGET,
+        "leakage": S7_DEFAULT_LEAKAGE,
+        "channel_growth": dict(S8_DEFAULT_GROWTH),
+        "channel_jan_target": dict(S8_DEFAULT_JAN_TARGET),
+        "channel_mar_target": dict(S8_DEFAULT_MAR_TARGET),
+        "optimizer_target": 1.20,
+        "channel_mapping": {},
+    }
+
+def _selected_metric_cell(
+    model: "ScenarioModel",
+    sales: str,
+    asset: str,
+) -> Dict[str, Any]:
+    sales_key = "GS" if sales == "Gross Sales" else "NS"
+    return model.cell(
+        sales_key,
+        asset=None if asset == "All" else asset,
+    )
+
+def _render_cut_summary(
+    model: "ScenarioModel",
+    sales: str,
+    asset: str,
+    channel: str,
+    location: str,
+) -> None:
+    sales_key = "GS" if sales == "Gross Sales" else "NS"
+    cell = _selected_metric_cell(model, sales, asset)
+
+    section(f"{sales} · Current State")
+    active = [x for x in [channel if channel != "All" else None,
+                          asset if asset != "All" else None,
+                          location if location != "All" else None] if x]
+    scope = " · ".join(active) if active else "All business"
+    st.markdown(f"<div class='note'><b>Scope:</b> {escape(scope)}</div>", unsafe_allow_html=True)
+
+    kpi_row([
+        ("FY Target", fmt_cr(cell.get("fy_target")), "Workbook target"),
+        ("YTD June Target", fmt_cr(cell.get("ytd_target")), "Workbook YTD target"),
+        ("YTD Achievement", fmt_cr(cell.get("ytd_ach")), 
+         fmt_pct(cell.get("ytd_ach_pct")) if _num(cell.get("ytd_ach_pct")) is not None else None),
+        ("Current Monthly RR", fmt_cr(cell.get("current_rr")), "YTD ÷ 3"),
+        ("Current March Projection", fmt_cr(cell.get("current_march")),
+         fmt_pct(cell.get("current_march_pct")) if _num(cell.get("current_march_pct")) is not None else None),
+    ])
+
+    # Asset-class cut is intentionally visible even when Asset Class = All.
+    if asset == "All":
+        rows = []
+        for a in ASSETS:
+            c = model.cell(sales_key, asset=a)
+            rows.append({
+                "Asset Class": a,
+                "FY Target": c.get("fy_target"),
+                "YTD Target": c.get("ytd_target"),
+                "YTD Achievement": c.get("ytd_ach"),
+                "Achievement %": c.get("ytd_ach_pct"),
+                "Current RR": c.get("current_rr"),
+                "Current March Projection": c.get("current_march"),
+                "Projected FY %": c.get("current_march_pct"),
+            })
+        frame = pd.DataFrame(rows)
+        show_table(frame, {
+            "Asset Class": "txt", "FY Target": "cr", "YTD Target": "cr",
+            "YTD Achievement": "cr", "Achievement %": "pct", "Current RR": "cr",
+            "Current March Projection": "cr", "Projected FY %": "pct",
+        })
+
+def _build_all_scenario_matrix(
+    filtered_grid: pd.DataFrame,
+    selected_scenario_id: int,
+    selected_params: Dict[str, Any],
+    sales_key: str,
+    asset: str,
+) -> pd.DataFrame:
+    """Calculate Scenarios 1-9 on the same selected cut."""
+    rows: List[Dict[str, Any]] = []
+    if filtered_grid.empty:
+        return pd.DataFrame()
+
+    for sid in SCENARIO_ORDER:
+        params = _scenario_default_params(sid)
+        if sid == selected_scenario_id:
+            # Sidebar controls are authoritative for the selected scenario.
+            params.update(selected_params)
+        try:
+            model = ScenarioModel(sid, filtered_grid, params)
+            cell = model.cell(sales_key, asset=None if asset == "All" else asset)
+            rows.append({
+                "Scenario": f"Scenario {sid}",
+                "Scenario Name": SCENARIOS[sid]["name"],
+                "FY Target": cell.get("fy_target"),
+                "Current YTD": cell.get("ytd_ach"),
+                "Current March Projection": cell.get("current_march"),
+                "Scenario March Estimate": cell.get("march_amount"),
+                "Scenario March %": cell.get("march_pct"),
+                "Run Rate": cell.get("scen_rr"),
+                "Run Rate Change %": cell.get("rr_change_pct"),
+                "Required / March Target": cell.get("march_required"),
+                "Headroom / Gap": cell.get("headroom_amt"),
+            })
+        except Exception as exc:
+            rows.append({
+                "Scenario": f"Scenario {sid}",
+                "Scenario Name": SCENARIOS[sid]["name"],
+                "Error": str(exc),
+            })
+    return pd.DataFrame(rows)
+
+def render_all_scenario_matrix(
+    filtered_grid: pd.DataFrame,
+    selected_scenario_id: int,
+    selected_params: Dict[str, Any],
+    sales: str,
+    asset: str,
+) -> None:
+    sales_key = "GS" if sales == "Gross Sales" else "NS"
+    section("All Scenarios · Selected Cut")
+    frame = _build_all_scenario_matrix(
+        filtered_grid, selected_scenario_id, selected_params, sales_key, asset
+    )
+    if frame.empty:
+        st.info("No scenario output is available for this cut.")
+        return
+
+    formats = {
+        "Scenario": "txt", "Scenario Name": "txt", "FY Target": "cr",
+        "Current YTD": "cr", "Current March Projection": "cr",
+        "Scenario March Estimate": "cr", "Scenario March %": "pct",
+        "Run Rate": "cr", "Run Rate Change %": "pct_signed",
+        "Required / March Target": "cr", "Headroom / Gap": "cr_signed",
+    }
+    show_table(frame, formats)
+
+    selected = frame.loc[frame["Scenario"] == f"Scenario {selected_scenario_id}"]
+    if not selected.empty:
+        row = selected.iloc[0]
+        st.markdown(
+            f"<div class='scenario-highlight'><b>Selected: Scenario {selected_scenario_id} · "
+            f"{SCENARIOS[selected_scenario_id]['name']}</b><br>"
+            f"{SCENARIOS[selected_scenario_id]['explanation']}<br>"
+            f"<span class='s-milestone'>{SCENARIOS[selected_scenario_id]['milestone']}</span></div>",
+            unsafe_allow_html=True,
+        )
+
+def render_final_reference_with_cuts(payload: bytes) -> None:
+    """
+    Keep FINAL as the workbook reference surface. This intentionally shows
+    the workbook values without rewriting them into model outputs.
+    """
+    with st.expander("FINAL sheet · source of truth", expanded=False):
+        st.markdown(
+            "<div class='note'>This is the uploaded workbook's FINAL sheet. "
+            "Its current targets, YTD achievement, AUM, run-rate estimations, "
+            "location cuts and scenario parameter blocks remain available for audit.</div>",
+            unsafe_allow_html=True,
+        )
+        try:
+            raw = load_final_sheet_frame(payload)
+            st.dataframe(raw, use_container_width=True, hide_index=True, height=620)
+        except Exception as exc:
+            st.warning(f"FINAL sheet could not be displayed: {escape(str(exc))}")
+
+def render_dashboard_with_management_cuts(records: pd.DataFrame, payload: bytes) -> None:
+    """
+    Replacement dashboard entry point:
+      - FINAL is loaded and displayed as the source layer.
+      - Management cuts are explicit dropdowns.
+      - Channel + Location recalculate the analytical grid.
+      - Asset + Sales select the displayed metric.
+      - Scenarios 1-9 are all evaluated for the selected cut.
+    """
+    scenario_id, params, _basis, mapping = render_sidebar(records)
+
+    records = map_business_segments(records, mapping)
+    channel_mapping = params.get("channel_mapping") or st.session_state.get("channel_mapping") or {}
+    records = map_business_channels(records, channel_mapping)
+
+    final_metrics = parse_final_dashboard_metrics(payload)
+
+    st.markdown(
+        "<div class='app-title'>Sales Target Achievement · FINAL + Scenario Planner</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        "<div class='app-sub'>FINAL workbook values → management cuts → current state → "
+        "all scenario projections → selected scenario detail</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("<div class='app-rule'></div>", unsafe_allow_html=True)
+
+    sales, channel, asset, location, filtered_records = render_management_cut_controls(records)
+
+    if filtered_records.empty:
+        render_final_reference_with_cuts(payload)
+        return
+
+    grid = build_base_grid(filtered_records)
+    model = ScenarioModel(scenario_id, grid, params)
+
+    # Keep FINAL visible for the unfiltered management view, while the selected
+    # cut always uses the same employee-level calculation engine.
+    if channel == "All" and location == "All":
+        render_final_metric_baseline(final_metrics, model)
+
+    _render_cut_summary(model, sales, asset, channel, location)
+
+    # Scenario 1-9 matrix is always calculated, not only the selected scenario.
+    render_all_scenario_matrix(grid, scenario_id, params, sales, asset)
+
+    # Detailed selected-scenario outputs continue to use the original engine.
+    section(f"Scenario {scenario_id} · {SCENARIOS[scenario_id]['name']} · Detailed Output")
+    if scenario_id == 6:
+        segment_counts = segment_diagnostics(filtered_records)
+        render_segment_section(model, "NS", segment_counts)
+    elif scenario_id == 7:
+        render_momentum_section(model, "NS")
+    elif scenario_id == 8:
+        render_channel_simulator(model, "NS")
+    elif scenario_id == 9:
+        render_channel_optimizer(model, "NS")
+    else:
+        # Existing detailed asset/vertical calculations, now on the selected cut.
+        render_vertical_section(model)
+        render_asset_section(model)
+
+    render_final_reference_with_cuts(payload)
+    render_export(model, "NS")
+
+# Use the new FINAL-aware management dashboard without changing the existing
+# scenario calculation engine.
+_ORIGINAL_RENDER_DASHBOARD = render_dashboard
+render_dashboard = render_dashboard_with_management_cuts
+
 if __name__ == "__main__":
     main()

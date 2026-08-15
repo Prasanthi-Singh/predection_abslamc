@@ -1,16 +1,3 @@
-"""
-=============================================================================
- SALES PERFORMANCE, SCENARIO PLANNING & REVENUE IMPACT DASHBOARD
-=============================================================================
- Senior-management decision-support application for asset-management sales.
- 
- Run with:
-     streamlit run app.py
- 
- Stack: Python | Streamlit | Pandas | NumPy | OpenPyXL
-=============================================================================
-"""
- 
 from __future__ import annotations
  
 import inspect
@@ -193,37 +180,37 @@ FINAL_SHEET_ALIASES: List[str] = ["FINAL", "Final", "Final Dashboard"]
  
 COLUMN_SPEC: Dict[Tuple[str, str], Dict[str, List[str]]] = {
     ("GS", "Equity"): {
-        "fy": ["FY 26 TGT EQ"],
-        "ytd_tgt": ["YTD June EQ TGT"],
-        "ach": ["Equity GS Ach YTD June"],
+        "fy": ["FY 26 TGT EQ", "Equity GS Targets"],
+        "ytd_tgt": ["YTD June EQ TGT", "Q1 Equity GS Targets"],
+        "ach": ["Equity GS Ach YTD June", "Equity GS Actuals"],
     },
     ("GS", "Debt"): {
-        "fy": ["FY 26 TGT DT"],
-        "ytd_tgt": ["YTD June DT TGT"],
-        "ach": ["Debt GS Ach"],
+        "fy": ["FY 26 TGT DT", "Debt GS Targets"],
+        "ytd_tgt": ["YTD June DT TGT", "Q1 Debt GS Targets"],
+        "ach": ["Debt GS Ach", "Debt GS Actuals"],
     },
     ("GS", "Liquid"): {
-        "fy": ["FY 26 TGT LIQ"],
-        "ytd_tgt": ["YTD June LIQ TGT"],
-        "ach": ["Liquid GS Ach"],
+        "fy": ["FY 26 TGT LIQ", "Liquid GS Targets"],
+        "ytd_tgt": ["YTD June LIQ TGT", "Q1 Liquid GS Targets"],
+        "ach": ["Liquid GS Ach", "Liquid GS Actuals"],
     },
     ("NS", "Equity"): {
-        "fy": ["FY 26 TGT EQ NS"],
-        "ytd_tgt": ["YTD June EQ NS TGT"],
-        "ach": ["Equity NS Ach YTD June"],
+        "fy": ["FY 26 TGT EQ NS", "Equity Net Targets"],
+        "ytd_tgt": ["YTD June EQ NS TGT", "Q1 Equity Net Targets"],
+        "ach": ["Equity NS Ach YTD June", "Equity Net Actuals"],
     },
     ("NS", "Debt"): {
-        "fy": ["FY 26 TGT DT NS"],
-        "ytd_tgt": ["YTD June DT NS TGT"],
-        "ach": ["Debt NS Ach"],
+        "fy": ["FY 26 TGT DT NS", "Debt Net Targets"],
+        "ytd_tgt": ["YTD June DT NS TGT", "Q1 Debt Net Targets"],
+        "ach": ["Debt NS Ach", "Debt Net Actuals"],
     },
     ("NS", "Liquid"): {
-        "fy": ["FY 26 TGT LIQ NS"],
-        "ytd_tgt": ["YTD June LIQ NS TGT"],
-        "ach": ["Liquid NS Ach"],
+        "fy": ["FY 26 TGT LIQ NS", "Liquid Net Targets"],
+        "ytd_tgt": ["YTD June LIQ NS TGT", "Q1 Liquid Net Targets"],
+        "ach": ["Liquid NS Ach", "Liquid Net Actuals"],
     },
 }
- 
+
 META_ALIASES: Dict[str, List[str]] = {
     "Employee Name": ["Employee Name", "Emp Name", "Name"],
     "Emp Code": ["Emp Code", "Employee Code"],

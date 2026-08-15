@@ -1394,54 +1394,194 @@ def render_final_metric_baseline(
     final_metrics: Dict[str, Any],
     model: "ScenarioModel",
 ) -> None:
-    """Headline management metrics sourced from FINAL."""
+    """
+    Management performance view from FINAL.
+
+    Gross Sales, Net Sales and AUM are deliberately presented as peer tabs.
+    AUM follows the FINAL sheet's exact Target / Current structure, rather
+    than being rendered as a separate section.
+    """
     section("Current Performance Metrics · FINAL")
- 
+
     gs = final_sales_metrics(final_metrics, model, "GS")
     ns = final_sales_metrics(final_metrics, model, "NS")
- 
+    aum = final_metrics.get("AUM")
+
+    tabs = st.tabs(["Gross Sales", "Net Sales", "AUM"])
+
     def overall(frame: pd.DataFrame) -> pd.Series:
         return (
             frame.loc["Overall"]
-            if not frame.empty and "Overall" in frame.index
+            if isinstance(frame, pd.DataFrame)
+            and not frame.empty
+            and "Overall" in frame.index
             else pd.Series(dtype=float)
         )
- 
-    gs_o = overall(gs)
-    ns_o = overall(ns)
- 
-    kpi_row([
-        ("GS FY27 Target", fmt_cr(gs_o.get("FY27 Target")), "FINAL", "off"),
-        ("GS YTD", fmt_cr(gs_o.get("YTD")),
-         fmt_pct(gs_o.get("Achievement %"))
-         if _num(gs_o.get("Achievement %")) is not None else None),
-        ("GS Current RR", fmt_cr(gs_o.get("Current RR")), "Current pace", "off"),
-        ("GS Required RR", fmt_cr(gs_o.get("Required RR to Target")), "Target pace", "off"),
-        ("GS Projected FY %", fmt_pct(gs_o.get("Projected FY %")),
-         None if _num(gs_o.get("Projected FY %")) is None
-         else fmt_pts(gs_o.get("Projected FY %") - 1.0)),
-    ])
- 
-    kpi_row([
-        ("NS FY27 Target", fmt_cr(ns_o.get("FY27 Target")), "FINAL", "off"),
-        ("NS YTD", fmt_cr(ns_o.get("YTD")),
-         fmt_pct(ns_o.get("Achievement %"))
-         if _num(ns_o.get("Achievement %")) is not None else None),
-        ("NS Current RR", fmt_cr(ns_o.get("Current RR")), "Current pace", "off"),
-        ("NS Required RR", fmt_cr(ns_o.get("Required RR to Target")), "Target pace", "off"),
-        ("NS Projected FY %", fmt_pct(ns_o.get("Projected FY %")),
-         None if _num(ns_o.get("Projected FY %")) is None
-         else fmt_pts(ns_o.get("Projected FY %") - 1.0)),
-    ])
- 
-    st.markdown(
-        "<div class='note'>Headline performance is sourced from the workbook's "
-        "<b>FINAL</b> sheet. Current RR shows the observed YTD pace; Required RR "
-        "shows the monthly pace implied by the full-year target.</div>",
-        unsafe_allow_html=True,
-    )
- 
- 
+
+    # ------------------------------------------------------------------
+    # Gross Sales — same presentation used previously.
+    # ------------------------------------------------------------------
+    with tabs[0]:
+        gs_o = overall(gs)
+        if gs.empty:
+            st.info("Gross Sales metrics could not be located in FINAL.")
+        else:
+            kpi_row([
+                ("GS FY27 Target", fmt_cr(gs_o.get("FY27 Target")), "FINAL", "off"),
+                ("GS YTD", fmt_cr(gs_o.get("YTD")),
+                 fmt_pct(gs_o.get("Achievement %"))
+                 if _num(gs_o.get("Achievement %")) is not None else None),
+                ("GS Current RR", fmt_cr(gs_o.get("Current RR")), "Current pace", "off"),
+                ("GS Required RR", fmt_cr(gs_o.get("Required RR to Target")), "Target pace", "off"),
+                ("GS Projected FY %", fmt_pct(gs_o.get("Projected FY %")),
+                 None if _num(gs_o.get("Projected FY %")) is None
+                 else fmt_pts(gs_o.get("Projected FY %") - 1.0)),
+            ])
+
+            display_cols = [
+                "FY27 Target", "YTD", "Achievement %",
+                "Current RR", "Required RR to Target",
+                "Estimated FY @ Current RR", "Projected FY %",
+            ]
+            display = gs.reset_index()[["Metric", *display_cols]]
+            formats = {
+                "Metric": "txt",
+                "FY27 Target": "cr",
+                "YTD": "cr",
+                "Achievement %": "pct",
+                "Current RR": "cr",
+                "Required RR to Target": "cr",
+                "Estimated FY @ Current RR": "cr",
+                "Projected FY %": "pct",
+            }
+            _render_metric_bifurcation(display, formats)
+
+    # ------------------------------------------------------------------
+    # Net Sales — same presentation used previously.
+    # ------------------------------------------------------------------
+    with tabs[1]:
+        ns_o = overall(ns)
+        if ns.empty:
+            st.info("Net Sales metrics could not be located in FINAL.")
+        else:
+            kpi_row([
+                ("NS FY27 Target", fmt_cr(ns_o.get("FY27 Target")), "FINAL", "off"),
+                ("NS YTD", fmt_cr(ns_o.get("YTD")),
+                 fmt_pct(ns_o.get("Achievement %"))
+                 if _num(ns_o.get("Achievement %")) is not None else None),
+                ("NS Current RR", fmt_cr(ns_o.get("Current RR")), "Current pace", "off"),
+                ("NS Required RR", fmt_cr(ns_o.get("Required RR to Target")), "Target pace", "off"),
+                ("NS Projected FY %", fmt_pct(ns_o.get("Projected FY %")),
+                 None if _num(ns_o.get("Projected FY %")) is None
+                 else fmt_pts(ns_o.get("Projected FY %") - 1.0)),
+            ])
+
+            display_cols = [
+                "FY27 Target", "YTD", "Achievement %",
+                "Current RR", "Required RR to Target",
+                "Estimated FY @ Current RR", "Projected FY %",
+            ]
+            display = ns.reset_index()[["Metric", *display_cols]]
+            formats = {
+                "Metric": "txt",
+                "FY27 Target": "cr",
+                "YTD": "cr",
+                "Achievement %": "pct",
+                "Current RR": "cr",
+                "Required RR to Target": "cr",
+                "Estimated FY @ Current RR": "cr",
+                "Projected FY %": "pct",
+            }
+            _render_metric_bifurcation(display, formats)
+
+    # ------------------------------------------------------------------
+    # AUM — peer tab, with the exact FINAL Target / Current columns.
+    # ------------------------------------------------------------------
+    with tabs[2]:
+        if not isinstance(aum, pd.DataFrame) or aum.empty:
+            st.info("AUM metrics could not be located in FINAL.")
+        else:
+            aum_display = aum.reset_index().rename(columns={"Metric": "Scope"})
+            aum_columns = [
+                c for c in
+                ["Scope", "Target", "Current", "Achievement %", "Gap to Target"]
+                if c in aum_display.columns
+            ]
+            aum_display = aum_display[aum_columns]
+
+            aum_formats = {
+                "Scope": "txt",
+                "Target": "cr",
+                "Current": "cr",
+                "Achievement %": "pct",
+                "Gap to Target": "cr_signed",
+            }
+
+            aum_o = (
+                aum.loc["Overall"]
+                if "Overall" in aum.index
+                else pd.Series(dtype=float)
+            )
+
+            kpi_row([
+                ("AUM Target", fmt_cr(aum_o.get("Target")), "FINAL", "off"),
+                ("AUM Current", fmt_cr(aum_o.get("Current")),
+                 fmt_pct(aum_o.get("Achievement %"))
+                 if _num(aum_o.get("Achievement %")) is not None else None),
+                ("AUM Gap", fmt_cr_signed(aum_o.get("Gap to Target")),
+                 "Target − Current", "off"),
+            ])
+
+            # Same bifurcation pattern as GS / NS:
+            # Overall → Asset Class → Channel.
+            overall_aum = aum_display.loc[
+                aum_display["Scope"] == "Overall"
+            ].copy()
+
+            asset_aum = aum_display.loc[
+                aum_display["Scope"].isin(FINAL_ASSET_ROWS)
+            ].copy()
+
+            channel_aum = aum_display.loc[
+                ~aum_display["Scope"].isin(["Overall", *FINAL_ASSET_ROWS])
+            ].copy()
+
+            if not overall_aum.empty:
+                st.markdown(
+                    "<div class='subsection-title'>Overall</div>",
+                    unsafe_allow_html=True,
+                )
+                show_table(overall_aum, aum_formats)
+
+            if not asset_aum.empty:
+                st.markdown(
+                    "<div class='subsection-title'>Asset Class</div>",
+                    unsafe_allow_html=True,
+                )
+                show_table(
+                    asset_aum.rename(columns={"Scope": "Asset Class"}),
+                    {**aum_formats, "Scope": "txt", "Asset Class": "txt"},
+                )
+
+            if not channel_aum.empty:
+                st.markdown(
+                    "<div class='subsection-title'>Channel</div>",
+                    unsafe_allow_html=True,
+                )
+                show_table(
+                    channel_aum.rename(columns={"Scope": "Channel"}),
+                    {**aum_formats, "Scope": "txt", "Channel": "txt"},
+                )
+
+            st.markdown(
+                "<div class='note'>AUM is sourced directly from the workbook's "
+                "<b>FINAL</b> sheet. The AUM tab uses the same management "
+                "hierarchy as Gross Sales and Net Sales while preserving the "
+                "Excel Target / Current columns.</div>",
+                unsafe_allow_html=True,
+            )
+
+
 def render_final_scenario_comparison(
     final_metrics: Dict[str, Any],
     model: "ScenarioModel",
